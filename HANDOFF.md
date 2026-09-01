@@ -581,6 +581,17 @@ layer03 gated pack             0.98%
 
 误差量级与 6.3 描述的 BF16 舍入一致，没有出现单点突变。
 
+**"greedy token 全对"是 prompt 相关的，不是不变量。** 在 oracle 那个 19 token 的
+prompt 上 32 个 token 全对；但换一个 prompt（`李世民是谁？和朱棣有什么共同点？`），
+即使 `compile=False` 也会在第 12 个 token 与 HF 分叉，该步 top1-top2 间距 0.1622
+（占 top1 的 0.926%）——落在 6.3 那四处 BF16-vs-FP32 差异造成的 ~1.1% 噪声带内，
+属于预期行为而不是 bug。
+
+判断分叉是否可接受，看的是**该步的 top-2 间距相对我们的噪声量级**，而不是 token
+是否相同。逐算子对拍（49 项）才是稳定的判据。如果确实需要与 HF 逐 token 一致，
+唯一办法是主动把精度降到与参考实现相同——即在 6.3 那四处也 round 到 BF16。
+那是一个取舍：贴合参考 vs 更准确，目前选的是后者。
+
 ## 8. 性能现状：为什么瓶颈不是计算
 
 这一节的结论推翻了本文档早期版本给出的优化顺序，全部为 A100 实测（绑核到单核、
@@ -679,7 +690,9 @@ top1-top2 间距只有 0.0067（占 top1 的 0.029%），其余各步是 1.4–3
 
 ## 9. 剩余工作
 
-**正确性里程碑已达成**：13 个 kernel + loader + runner 打通，端到端 greedy 32 个 token 与 Hugging Face 逐个相同，49 项逐算子对拍全部在容差内（第 7 节）。
+**正确性里程碑已达成**：13 个 kernel + loader + runner 打通，49 项逐算子对拍全部在容差内，oracle prompt 上端到端 greedy 32 个 token 与 Hugging Face 逐个相同（第 7 节）。注意 token 全对是 prompt 相关的，逐算子对拍才是稳定判据，见 7.3 末尾。
+
+`demo.py` 可以直接对话：`python demo.py "你的问题"`。
 
 已完成的：全部 kernel、`gemm_2d` 真实尺寸测试、数值 oracle、权重加载器、单层对拍、24 层完整重算 runner。
 
@@ -809,6 +822,7 @@ python triton_kernels/vocab_argmax.py
 引擎和对拍：
 
 ```bash
+python demo.py "李世民是谁？和朱棣有什么共同点？"   # 交互 demo，流式输出
 python engine/loader.py                        # 权重加载 + 全部断言
 python engine/runner.py                        # 端到端生成 32 token
 python tests/test_gemm_model_shapes.py         # gemm_2d 真实尺寸，28 组
