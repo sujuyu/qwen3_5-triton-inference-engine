@@ -94,6 +94,10 @@ T ∈ {1, 19, 65, 129}
 
 `N=248320` 的 LM head 不走这个 kernel，由 `vocab_argmax.py` 融合处理。
 
+性能上这个 kernel 是达标的：CUDA Graph 下 105-145 TFLOPS，相当于 cuBLAS 的
+1.1-1.2 倍耗时，个别形状还更快。不要凭 eager 下的逐 kernel 计时判断它慢，
+详见 8.5。
+
 ### 3.2 `qwen_rmsnorm.py` — `wy_lib::qwen_rmsnorm`
 
 接口支持最后一维 256 或 1024：
@@ -281,7 +285,23 @@ delta  = u_base - w @ state_in
 
 `P` 用前代法逐行求逆（`for row in tl.range(1, BLOCK_T)`）。三段的并行度分别是 `(chunk, head)`、`(head, v_tile)`（chunk 间串行）、`(chunk, head, v_tile)`。
 
-已知的性能待办：`prepare_wy` 一个 program 一次性 materialize 全部 `64×64` 和 `64×DK` 中间量，寄存器压力大，注释里标注为「简单正确性版本」，后续应在 DK/DV 上分块。`chunk_state`/`chunk_output` 的 `BLOCK_V` 硬编码为 16，也没有 autotune。
+**这条路径当前比 sequential 慢约 20 倍，不能直接切换。** CUDA event 实测（`H=16, DK=DV=128`，
+折算成 18 层）：
+
+```text
+T=32    sequential  2.29ms   chunked  46.16ms
+T=128   sequential  2.34ms   chunked  64.25ms
+T=1024  sequential 19.41ms   chunked 351.61ms
+```
+
+主要原因在 `prepare_wy`：求 `P=(I+L)^-1` 用的是 `for row in tl.range(1, BLOCK_T)`
+的逐行前代法，64 步串行，每步还做一次 `[64,64]` 的全矩阵规约；同时一个 program
+一次性 materialize 全部 `64×64` 和 `64×DK` 中间量，寄存器压力很大。注释里自称
+「简单正确性版本」，确实只能算正确性版本。
+
+所以"切 chunk-64 提速"这件事**需要重写而不是切换**：至少要把前代法换成分块回代
+或 Newton 迭代求逆，并在 DK/DV 上分块。`chunk_state`/`chunk_output` 的 `BLOCK_V`
+硬编码为 16、没有 autotune，也是同一批待办。
 
 测试结果（2026-09-01 A100 实测，`H=16, DK=DV=128`）：
 
@@ -681,7 +701,58 @@ top1-top2 间距只有 0.0067（占 top1 的 0.029%），其余各步是 1.4–3
 间距 <0.5% 判为近似平局。没有这个数字，下次有人看到 token 不一致会去查一个
 根本不存在的 bug。
 
-### 8.4 一个测量陷阱
+### 8.4 GPU 侧的真实构成
+
+compile 把 CPU 开销降下来之后，CPU 入队和 GPU 执行几乎完全平衡，GPU 时间开始随 T 增长：
+
+```text
+T=200   CPU 入队  9.15 ms | GPU 执行  8.84 ms
+T=400   CPU 入队 14.38 ms | GPU 执行 14.23 ms
+```
+
+各部分占 forward GPU 时间的比例：
+
+```text
+        forward 总    GQA×6层   占比    GDN seq×18层  占比
+T=128     20.49ms     0.64ms     3%       2.38ms      12%
+T=256     25.54ms     0.71ms     3%       4.49ms      18%
+T=512     25.60ms     0.63ms     2%       8.61ms      34%
+T=1024    30.19ms     0.68ms     2%      17.07ms      57%
+```
+
+两个结论：
+
+- **full attention 只占 2-3%，而且完全不随 T 增长**（0.63-0.71ms 一条平线）。
+  给它加 KV cache 不是提速手段——它的价值只在于"增量 decode 的必需件"。
+- **GDN sequential 是唯一随 T 显著增长的项**，从 12% 涨到 57%。切到
+  `gdn_recurrent_decode` 后从 O(T) 变 O(1)，这是最大的单点收益。
+
+### 8.5 `gemm_2d` 的效率是达标的
+
+用 CUDA Graph 摘掉 CPU 开销后测真实核性能：
+
+```text
+        (T,K,N)     triton     cuBLAS      比   triton TFLOPS
+(128,1024,6144)     15.3us     13.0us    1.2x          105.2
+(512,1024,6144)     44.4us     36.8us    1.2x          145.1
+(512,1024,3584)     32.2us     30.5us    1.1x          116.6
+(512,3584,1024)     44.7us     26.8us    1.7x           84.1
+(1024,1024,3584)    57.5us     60.7us    0.9x          130.7
+```
+
+105-145 TFLOPS，与 cuBLAS 相差 1.1-1.2 倍，有一例还更快。**不要去优化它**，
+唯一偏弱的是 `K=3584` 那组（1.7x），要动也只动那一个形状的 tiling。
+
+**这一节存在的主要意义是记录一个测量方法**：在 eager 下逐 kernel 计时会得到
+"`gemm_2d` 比 cuBLAS 慢 5.3 倍、只有 6.9 TFLOPS"的结论，那是**假的**——每次调用
+约 90μs 的 CPU 开销远大于 15μs 的 GPU 工作，GPU 是饿死的，CUDA event 量到的是
+CPU 停顿。同样地，8.4 表里 T=128 那行的 "forward 总 GPU 20.49ms" 也被 CPU 拖高了，
+真实 GPU 工作量按 FLOPs 估只有几毫秒。
+
+**要测 kernel 的真实 GPU 效率，必须先用 CUDA Graph 或 torch.compile 把 CPU 摘掉。**
+本仓库任何"kernel 慢"的结论，如果不是这样测的，先怀疑测量方法。
+
+### 8.6 一个测量陷阱
 
 不要在同一个进程里先跑 compiled 再跑 eager 做对照。dynamo 的 frame hook 会拦截
 同一个函数对象反复做 guard 检查和重编译尝试，eager 会被测成 6142 ms/token
@@ -708,24 +779,31 @@ top1-top2 间距只有 0.0067（占 top1 的 0.029%），其余各步是 1.4–3
      各是一次重编译，每次数十秒）；桶少一点、粗一点，代价是个别长度的 tuning 不最优。
    - 评估低层 `torch.library.Library` 注册（7.25μs vs `triton_op` 18.56μs，见 8.2）。
      这条路 eager 就能快 2.6 倍，不依赖 compile，适合短生成场景。
-2. **切增量 decode**。理由不再是"省 FLOPs"，而是**让 shape 静态化**——T 固定为 1
-   之后 compile 只需编译一次、能吃上 cudagraph，与第 1 项是乘性的。需要三件：
-   - `depthwise_causal_conv4_decode`：维护 `[6144,4]` conv state，移位/环形更新后做 4-tap dot product；
-   - 带 KV cache 的 GQA decode kernel：只算新 query 对全部历史 K/V；
+2. **切增量 decode**（最大的一块）。两重收益：GDN 从 O(T) 变 O(1)——它是唯一随 T
+   显著增长的项，T=1024 时占 GPU 时间 57%（见 8.4）；同时 T 固定为 1 让 shape 静态化，
+   cudagraph 变得可用，而 cudagraph 能把 CPU 开销完全摘掉（8.5 里 93μs → 15μs 就是
+   这么来的）。两者是乘性的。
+
+   需要三件，**必须齐了才能切**——24 层里 18 层是 GDN，缺 `conv4_decode` 这 18 层就
+   得全序列重算；而每层输入依赖上一层所有位置的输出，所以只要有一层要全序列，
+   那 6 层 attention 也拿不到"只有一个新 token"的输入：
+
+   - `depthwise_causal_conv4_decode`：维护 `[6144,4]` conv state，移位/环形更新后做
+     4-tap dot product。三件里最小，建议先做；
+   - 带 KV cache 的 GQA decode kernel：只算新 query 对全部历史 K/V。**注意它本身不是
+     提速手段**——full attention 只占 GPU 时间 2-3% 且不随 T 增长（8.4），做它纯粹
+     因为它是 decode 模式的必需件；
    - GDN 侧直接接已有的 `gdn_recurrent_decode`（state cache 路径已验证）。
 
    齐了之后把 runner 拆成 prefill + decode 两条路径，用当前的完整重算版本做等价性
-   对拍——**现在这个 runner 就是那个基准**（`compile=False` 那条路径与 HF 逐 token 一致）。
-3. **prefill 切 chunk-64**。当前 GDN 走 sequential。切换成本很低
-   （`call_gdn_recurrent_prefill_chunked_triton` 与 sequential 接口完全一致），但
-   chunk 那条路径是 Codex 写的、没逐行审过，切之前值得过一遍代码；
-   `tests/test_oracle_parity.py` 可以直接复用作回归。注意在调用开销解决之前，
-   这一项的收益同样量不出来。
+   对拍——**现在这个 runner 就是那个基准**（`compile=False` 那条路径逐算子对得上 HF）。
+3. **重写 chunk-64 prefill**。注意是重写不是切换：当前实现比 sequential 慢约 20 倍
+   （见 3.10），`prepare_wy` 里 64 步串行的前代法求逆是主因。要动就得把它换成分块回代
+   或 Newton 迭代，并在 DK/DV 上分块。优先级低于第 2 项，因为 prefill 只跑一次。
 4. **扩测试覆盖**：目前 oracle 只有一个 19 token 的中文 prompt。至少再加一个长 prompt
    （跨过 chunk-64 和 `T_BUCKET` 边界，比如 T=65/129）和一个英文 prompt。
-5. **kernel 级性能收尾**：`prepare_wy` 的 DK/DV 分块、`chunk_state`/`chunk_output`
-   的 BLOCK_V autotune、`gdn_qk_norm_gates` 的 head 分块。同样要等调用开销解决后再做，
-   否则改了也看不出差别。
+5. **kernel 级性能收尾**：`gdn_qk_norm_gates` 的 head 分块、`chunk_state`/`chunk_output`
+   的 BLOCK_V autotune。**不包括 `gemm_2d`**——它已经是 cuBLAS 的 1.1-1.2 倍，达标了（8.5）。
 6. 可选：top-k/top-p/temperature sampling、batch/padding。
 
 host 侧还缺的：`tokenize_text.py` 目前只实现了单轮 non-thinking chat 模板的子集，多轮对话和 thinking 模式要补。停止 token（`<|im_end|>`=248046、`<|endoftext|>`=248044）已经在 runner 里作为默认值。
