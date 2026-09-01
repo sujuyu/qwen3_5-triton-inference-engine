@@ -90,8 +90,23 @@ def _depthwise_causal_conv4_decode_triton(
     #   4. silu：Triton 3.7 的 tl.sigmoid 要求 FP32，acc 保持 FP32 即可
     #   5. 把 new_state 写回 state_ptr，把 y 写到 out_ptr
     #
-    # K=4 很小，直接把 4 列展开成标量变量、不用 tl.arange(0,K) 也可以，
-    # 那样能省掉一次二维 load 的地址计算。两种写法都试试看哪个快。
+    # 不需要 concat：`tl.cat` 在这里用不了（[BLOCK_D,3] 的 3 不是 2 的幂，
+    # 会报 "Shape element 1 must be a power of 2"），而且移位本来就等价于变量重命名。
+    #
+    # 方案 A（K=4 展开成 4 个标量列，推荐）：
+    #   s1,s2,s3 = state 的第 1,2,3 列（第 0 列是 x[t-4]，直接不 load）
+    #   xv       = x
+    #   acc = w0*s1 + w1*s2 + w2*s3 + w3*xv        ← 移位后的点乘求和
+    #   写回时目标下标各减 1：0<-s1, 1<-s2, 2<-s3, 3<-xv
+    #
+    # 方案 B（二维，用带偏移的再次 load 代替 concat）：
+    #   kk = tl.arange(0, 4)
+    #   shifted = tl.load(..., (kk+1)*stride_k, mask=kk<3, other=0.0)
+    #   new = tl.where(kk[None,:] < 3, shifted, xv[:,None])
+    #   acc = tl.sum(new.to(tl.float32) * w.to(tl.float32), axis=1)
+    #
+    # 注意 depthwise 通道之间不混合，**不要用 tl.dot**；acc 保持 FP32，
+    # Triton 3.7 的 tl.sigmoid 要求 FP32。
     tl.static_assert(K == 4, "本 kernel 只针对 conv_kernel_size=4 特化")
 
 
