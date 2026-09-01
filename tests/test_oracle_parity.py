@@ -26,6 +26,9 @@ from engine.runner import build_runner
 
 ORACLE = ROOT / "oracle"
 
+# compiled 那一节要多花约 5s（热缓存）到 2 分钟（冷缓存），传 --no-compile 可跳过。
+SKIP_COMPILE = "--no-compile" in sys.argv
+
 
 def rel_error(actual: torch.Tensor, expected: torch.Tensor) -> tuple[float, float]:
     """返回 (最大绝对误差, 相对于 expected 幅度的相对误差)。"""
@@ -45,6 +48,32 @@ def check(name: str, actual, expected, tol: float, results: list) -> None:
     print(f"{flag} {name:44} max_abs={max_abs:10.6f}  rel={rel:8.4%}  (tol {tol:.1%})")
 
 
+def report_divergence(runner, input_ids, actual, expected) -> None:
+    """token 分叉时，先报告那一步的 top-2 间距。
+
+    间距极小说明模型本身在这个位置就无所谓，任何 BF16 级扰动都会翻转它，
+    不是 bug；间距大才说明真出了问题。没有这个数字，很容易去查一个不存在的 bug。
+    """
+    first = next(i for i, (a, b) in enumerate(zip(actual, expected)) if a != b)
+    prefix = torch.cat(
+        [
+            input_ids,
+            torch.tensor(expected[:first], dtype=torch.int32, device=input_ids.device),
+        ]
+    )
+    hidden = runner.forward(prefix)[-1].float()
+    logits = runner.w.embed_tokens.float() @ hidden
+    top2 = logits.topk(2)
+    gap = (top2.values[0] - top2.values[1]).item()
+    rel = gap / abs(top2.values[0].item())
+    print(f"   !! 第 {first} 个 token 分叉: {actual[first]} vs oracle {expected[first]}")
+    print(f"      该步 top1-top2 间距 = {gap:.4f}（占 top1 的 {rel:.3%}）")
+    if rel < 0.005:
+        print("      间距极小，属于近似平局被数值噪声翻转，不是 bug")
+    else:
+        print("      间距不小，需要按逐算子结果排查")
+
+
 def main() -> None:
     assert ORACLE.exists(), (
         f"{ORACLE} 不存在，先跑 .venv-oracle/bin/python tools/dump_oracle.py"
@@ -54,7 +83,9 @@ def main() -> None:
     o_gdn = torch.load(ORACLE / "layer00_gdn.pt")
     o_attn = torch.load(ORACLE / "layer03_attn.pt")
 
-    runner = build_runner()
+    # 严格对拍必须走 eager：compiled 与 eager 相对差约 1.1%（BF16 量级），
+    # 足以在近似平局处翻转 argmax。见 HANDOFF.md 第 8 节。
+    runner = build_runner(compile=False)
     input_ids = meta["input_ids"].to(torch.int32).cuda()
     token_num = int(meta["seq_len"])
     heads, head_dim = runner.w.linear_num_heads, runner.w.linear_head_dim
@@ -231,12 +262,28 @@ def main() -> None:
     print(f"   oracle : {expected_tokens}")
     print(f"   triton : {actual_tokens}")
     if match:
-        print(f"   32 个 token 逐个相同 ✓")
+        print(f"   {len(expected_tokens)} 个 token 逐个相同 ✓")
     else:
-        first = next(
-            i for i, (a, b) in enumerate(zip(actual_tokens, expected_tokens)) if a != b
-        )
-        print(f"   !! 第 {first} 个 token 开始分叉: {actual_tokens[first]} vs {expected_tokens[first]}")
+        report_divergence(runner, input_ids, actual_tokens, expected_tokens)
+
+    if not SKIP_COMPILE:
+        print("\n===== compiled vs eager =====")
+        compiled = build_runner(compile=True)
+        c_hidden = compiled.forward(input_ids).float()
+        e_hidden = trace["final_norm"].float()
+        max_abs, rel = rel_error(c_hidden, e_hidden)
+        print(f"   final hidden 相对差 {rel:.4%}（BF16 量级，非 bit-identical）")
+        c_tokens = compiled.generate(input_ids, max_new_tokens=len(expected_tokens))
+        if c_tokens == expected_tokens:
+            print(f"   compiled greedy 也与 oracle 逐个相同")
+        else:
+            first = next(
+                i for i, (a, b) in enumerate(zip(c_tokens, expected_tokens)) if a != b
+            )
+            print(f"   compiled 在第 {first} 个 token 与 oracle 分叉（预期内）")
+            report_divergence(runner, input_ids, c_tokens, expected_tokens)
+        # compiled 只要求与 eager 在 BF16 量级一致，不要求 token 全同
+        assert rel < 0.05, f"compiled 与 eager 相对差 {rel:.2%} 超出 BF16 量级"
 
     print("\n===== 汇总 =====")
     failed = [r for r in results if not r[4]]

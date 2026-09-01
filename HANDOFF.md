@@ -581,30 +581,145 @@ layer03 gated pack             0.98%
 
 误差量级与 6.3 描述的 BF16 舍入一致，没有出现单点突变。
 
-## 8. 剩余工作
+## 8. 性能现状：为什么瓶颈不是计算
+
+这一节的结论推翻了本文档早期版本给出的优化顺序，全部为 A100 实测（绑核到单核、
+满 boost 3294MHz；不绑核时干活的核也会 boost，空闲核停在 1500MHz，`lscpu` 显示的
+"66%" 是这么来的，不影响测量）。
+
+### 8.1 eager 下 92% 的时间是调用开销
+
+```text
+T=19    41.3 ms/forward        T=129   44.6 ms
+T=35    41.3 ms                T=257   44.5 ms
+T=55    44.0 ms
+```
+
+**forward 耗时几乎不随 T 变化。** 一次 forward 有 422 次 op 调用，每次约 90μs，
+合计约 38ms —— 占 41ms 的 92%。也就是说当前根本没到 compute bound，
+"完整重算浪费 FLOPs" 在这个尺寸下不是问题。
+
+单次 `gemm_2d` 调用的 90μs 构成：
+
+```text
+~16 us   实际计算 + 最小分发（以 cuBLAS 同尺寸 15.7us 为参照）
+~35 us   Triton 自己的 Python launch 路径（autotune + jit.run + 13 个参数的特化）
+~40 us   torch.library 的分发链
+```
+
+### 8.2 那 40μs 具体是什么
+
+同一个 trivial 负载，逐层加封装：
+
+```text
+(a) 裸 python 函数                 3.32 us
+(b) torch.library.Library（低层）   7.25 us   (+3.93)  ← dispatcher 本身
+(c) torch.library.custom_op       16.00 us   (+8.75)  ← custom_op 的安全机制
+(d) torch.library.triton_op       18.56 us   (+2.56)  ← wrap_triton
+
+custom_op 在 no_grad 下            15.81 us            ← 关梯度也省不掉
+```
+
+所以**不是 "torch 分发慢"**——dispatcher 本身只要 3.93μs。贵的是 `custom_op`
+每次调用无条件跑的安全机制（`torch/_library/custom_ops.py:374`）：schema 查找 →
+`_is_view_op()` → `_c_check_aliasing_constraint`（遍历所有 args/kwargs/results
+检查 storage 别名），外面还套 `autograd_impl` → `forward_no_grad` →
+`redispatch_boxed` 三层 boxing。参数越多越贵，`gemm_2d` 那种一堆 stride 的签名尤其吃亏。
+
+把 `triton_op` 换成 `custom_op` 只省 2.56μs，解决不了问题，还会让 Inductor
+没法 trace 进 kernel。**这 40μs 是进入 compile 生态的门票钱，正确做法是把 compile
+用起来让它归零，而不是把门票退掉。**
+
+备选（尚未采用）：低层 `torch.library.Library` 注册只要 7.25μs，比 `triton_op`
+便宜 2.6 倍，且照样能配 `register_fake`。代价是 Inductor 只能把 kernel 当黑盒——
+对这 13 个手写 kernel 而言本来也不希望它 fuse 进去。如果将来要留在 eager，这是条路。
+
+### 8.3 torch.compile 的实测收益与代价
+
+```text
+0 图断点，单图 572 个 op        ← 13 个 kernel 全部 trace 通
+eager                41.3 ms
+compile(default)      6.4 ms    6.5x
+compile(reduce-overhead) 7.7 ms  ← cudagraph 在这个尺寸下反而更慢
+```
+
+`register_fake` 是这条路走通的前提，写它的投入在这里兑现。
+
+**启动成本**：
+
+```text
+冷缓存（每个代码版本第一次）   50s + 65s
+热缓存（每个进程）            2.3s + 2.5s ≈ 4.8s
+```
+
+T 第一次变化时会再编一次（切 dynamic shape），之后任意 T 复用同一张图；
+只有跨过 kernel 的 `T_BUCKET` 边界（1/16/17/64/65/128/129 附近）才会再编——
+因为 `T_BUCKET` 是 `tl.constexpr`，桶变了就是另一份特化。
+
+**盈亏平衡约 137 次 forward**（4.8s ÷ 每次省 35ms）。完整重算下一次 forward
+出一个 token，所以生成不到约 137 个 token 时 eager 更快：32 token 大约 5.0s，
+eager 只要 1.3s。`Qwen35Runner(compile=False)` 可关。
+
+**数值代价**：compiled 与 eager 的 final hidden 相对差约 1.1%（BF16 量级，
+13.9% 的元素差 >0.1）。这在固定 prompt 上的第 28 步翻转了一次 argmax——但那一步
+top1-top2 间距只有 0.0067（占 top1 的 0.029%），其余各步是 1.4–3.5。属于模型本身
+无所谓的位置上噪声翻硬币，不是 bug。
+
+**推论**：不要把"greedy token 全对"当成唯一验收标准，它在平局处天然是脆的。
+`tests/test_oracle_parity.py` 现在会在分叉时自动报告该步的 top-2 间距，
+间距 <0.5% 判为近似平局。没有这个数字，下次有人看到 token 不一致会去查一个
+根本不存在的 bug。
+
+### 8.4 一个测量陷阱
+
+不要在同一个进程里先跑 compiled 再跑 eager 做对照。dynamo 的 frame hook 会拦截
+同一个函数对象反复做 guard 检查和重编译尝试，eager 会被测成 6142 ms/token
+（真实值 41ms，差 150 倍）。要干净的 eager 基线就开新进程，或用 `compile=False`
+构造独立的 runner。
+
+## 9. 剩余工作
 
 **正确性里程碑已达成**：13 个 kernel + loader + runner 打通，端到端 greedy 32 个 token 与 Hugging Face 逐个相同，49 项逐算子对拍全部在容差内（第 7 节）。
 
 已完成的：全部 kernel、`gemm_2d` 真实尺寸测试、数值 oracle、权重加载器、单层对拍、24 层完整重算 runner。
 
+**注意优先级已按第 8 节的实测重排。** 早期版本把"切增量 decode"排第一，那是错的：
+当前根本不是 compute bound，forward 耗时在 T=19 到 257 之间几乎不变，92% 是调用开销。
+在解决调用开销之前，任何减少 FLOPs 的优化都量不出收益。
+
 剩下的按建议顺序：
 
-1. **切增量 decode**。当前 1.09 s/token，瓶颈是每步都对整个序列重算。需要三件东西：
+1. **降低启动成本**，让默认开的 compile 真正划算。当前盈亏平衡在约 137 次 forward，
+   短生成反而更慢。两个方向：
+   - 收敛 kernel 的 `T_BUCKET` 桶边界，减少跨桶重编译（现在 1/16/17/64/65/128/129
+     各是一次重编译，每次数十秒）；桶少一点、粗一点，代价是个别长度的 tuning 不最优。
+   - 评估低层 `torch.library.Library` 注册（7.25μs vs `triton_op` 18.56μs，见 8.2）。
+     这条路 eager 就能快 2.6 倍，不依赖 compile，适合短生成场景。
+2. **切增量 decode**。理由不再是"省 FLOPs"，而是**让 shape 静态化**——T 固定为 1
+   之后 compile 只需编译一次、能吃上 cudagraph，与第 1 项是乘性的。需要三件：
    - `depthwise_causal_conv4_decode`：维护 `[6144,4]` conv state，移位/环形更新后做 4-tap dot product；
    - 带 KV cache 的 GQA decode kernel：只算新 query 对全部历史 K/V；
    - GDN 侧直接接已有的 `gdn_recurrent_decode`（state cache 路径已验证）。
 
-   齐了之后把 runner 拆成 prefill + decode 两条路径，用当前的完整重算版本做等价性对拍——**现在这个 runner 就是那个基准**。
-2. **prefill 切 chunk-64**。当前 GDN 走 sequential，长 prompt 会明显偏慢。切换成本很低（`call_gdn_recurrent_prefill_chunked_triton` 与 sequential 接口完全一致），但 chunk 那条路径是 Codex 写的、没逐行审过，切之前值得过一遍代码；`tests/test_oracle_parity.py` 可以直接复用作回归。
-3. **性能收尾**：`gemm_2d` 的 tuning、`prepare_wy` 的 DK/DV 分块、`chunk_state`/`chunk_output` 的 BLOCK_V autotune、`gdn_qk_norm_gates` 的 head 分块。
-4. **扩测试覆盖**：目前 oracle 只有一个 19 token 的中文 prompt。至少再加一个长 prompt（跨过 chunk-64 边界，比如 T=65/129）和一个英文 prompt。
-5. 可选：top-k/top-p/temperature sampling、batch/padding。
+   齐了之后把 runner 拆成 prefill + decode 两条路径，用当前的完整重算版本做等价性
+   对拍——**现在这个 runner 就是那个基准**（`compile=False` 那条路径与 HF 逐 token 一致）。
+3. **prefill 切 chunk-64**。当前 GDN 走 sequential。切换成本很低
+   （`call_gdn_recurrent_prefill_chunked_triton` 与 sequential 接口完全一致），但
+   chunk 那条路径是 Codex 写的、没逐行审过，切之前值得过一遍代码；
+   `tests/test_oracle_parity.py` 可以直接复用作回归。注意在调用开销解决之前，
+   这一项的收益同样量不出来。
+4. **扩测试覆盖**：目前 oracle 只有一个 19 token 的中文 prompt。至少再加一个长 prompt
+   （跨过 chunk-64 和 `T_BUCKET` 边界，比如 T=65/129）和一个英文 prompt。
+5. **kernel 级性能收尾**：`prepare_wy` 的 DK/DV 分块、`chunk_state`/`chunk_output`
+   的 BLOCK_V autotune、`gdn_qk_norm_gates` 的 head 分块。同样要等调用开销解决后再做，
+   否则改了也看不出差别。
+6. 可选：top-k/top-p/temperature sampling、batch/padding。
 
 host 侧还缺的：`tokenize_text.py` 目前只实现了单轮 non-thinking chat 模板的子集，多轮对话和 thinking 模式要补。停止 token（`<|im_end|>`=248046、`<|endoftext|>`=248044）已经在 runner 里作为默认值。
 
-## 9. 权重与运行环境
+## 10. 权重与运行环境
 
-### 9.1 Checkpoint 张量名
+### 10.1 Checkpoint 张量名
 
 本地 checkpoint 为单文件 `Qwen3.5-0.8B/model.safetensors-00001-of-00001.safetensors`，索引在 `model.safetensors.index.json`。三个顶层命名空间：
 
@@ -655,7 +770,7 @@ full-attention 层（i ∈ {3,7,11,15,19,23}）额外有：
 
 所有线性层都没有 bias；名字里唯一带 bias 的是 GDN 的 `dt_bias`，它是 softplus 的偏置，不是 GEMM bias。以上形状和 dtype 已直接从 safetensors header 核对。
 
-### 9.2 环境
+### 10.2 环境
 
 已确认环境：
 
@@ -694,11 +809,15 @@ python triton_kernels/vocab_argmax.py
 引擎和对拍：
 
 ```bash
-python engine/loader.py                   # 权重加载 + 全部断言
-python engine/runner.py                   # 端到端生成 32 token
-python tests/test_gemm_model_shapes.py    # gemm_2d 真实尺寸，28 组
-python tests/test_oracle_parity.py        # 对 oracle 逐算子 + 端到端，49 项
+python engine/loader.py                        # 权重加载 + 全部断言
+python engine/runner.py                        # 端到端生成 32 token
+python tests/test_gemm_model_shapes.py         # gemm_2d 真实尺寸，28 组
+python tests/test_oracle_parity.py             # 逐算子 + 端到端 + compiled/eager，49 项
+python tests/test_oracle_parity.py --no-compile  # 跳过 compiled 那一节，省几秒到两分钟
 ```
+
+对拍脚本用 `compile=False` 构造 runner——compiled 路径与 eager 相对差约 1.1%，
+不能用来做逐算子严格对拍（见 8.3）。
 
 `gdn_recurrent_prefill.py` 跑得最久（chunk + sequential + decode 三组，含 autotune）。
 
@@ -709,7 +828,7 @@ python -m py_compile triton_kernels/<file>.py
 python triton_kernels/<file>.py
 ```
 
-## 10. 协作偏好
+## 11. 协作偏好
 
 用户有 kernel 经验，希望沟通简洁：默认只说明输入、输出、运算逻辑和必要的布局/精度问题。
 

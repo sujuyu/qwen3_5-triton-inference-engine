@@ -2,7 +2,7 @@
 
 当前策略是**完整重算**：每生成一个 token，就对增长后的整个序列重跑一次 forward。
 GDN 的 recurrent state 在单次 forward 内从零开始按 token 顺序推进，forward 之间不保留。
-KV cache、conv state cache 和增量 decode 等 kernel 齐了之后再切（见 HANDOFF.md 第 8 节）。
+KV cache、conv state cache 和增量 decode 等 kernel 齐了之后再切（见 HANDOFF.md 第 9 节）。
 
 布局要点（踩过的坑都在这）：
 
@@ -47,10 +47,29 @@ DEFAULT_STOP_IDS = (248046, 248044)
 
 
 class Qwen35Runner:
-    def __init__(self, weights: TextWeights):
+    """完整重算前向。默认开 torch.compile。
+
+    compile 的收益和代价（A100 实测，详见 HANDOFF.md 第 8 节）：
+
+    - eager 41.3 ms/forward，compile 后 6.4 ms，约 6.5x。eager 下 92% 的时间是
+      torch.library 的分发开销，跟 T 几乎无关（T=19 到 257 都是 41-45ms）。
+    - 启动成本：冷缓存（每个代码版本第一次）约 50s + 65s；Inductor 磁盘缓存命中后
+      每个进程约 2.3s + 2.5s ≈ 4.8s。之后 T 变化不再重编译，除非跨过 kernel 的
+      T_BUCKET 边界（1/16/17/64/65/128/129 附近），那时会再编一次。
+    - **盈亏平衡约 137 次 forward**（4.8s ÷ 每次省 35ms）。短生成反而更慢：
+      32 token 大约 5.0s，eager 只要 1.3s。一次性跑几十个 token 的场景请传
+      compile=False。
+    - **compiled 与 eager 的结果不是 bit-identical**，相对差约 1.1%（BF16 量级）。
+      这足以在 top-1/top-2 极接近时翻转 argmax。传 compile=False 可拿到与
+      Hugging Face 逐 token 一致的那条路径，逐算子对拍必须用它。
+    """
+
+    def __init__(self, weights: TextWeights, compile: bool = True):
         self.w = weights
         self.eps = weights.rms_norm_eps
         self.device = weights.device
+        self._compiled = torch.compile(self._forward) if compile else None
+        self._compile_announced = not compile
 
         # inv_freq[j] = 1 / theta^(2j/R)，与参考实现的 compute_default_rope_parameters 一致。
         r = weights.rotary_dim
@@ -66,12 +85,18 @@ class Qwen35Runner:
         self._position_ids: torch.Tensor | None = None
 
     def _positions(self, token_num: int) -> torch.Tensor:
-        """[1,T] int32。纯文本下三个 MRoPE 轴相同，退化为普通 RoPE。"""
+        """[1,T] int32。纯文本下三个 MRoPE 轴相同，退化为普通 RoPE。
+
+        **必须在 compile 区域之外调用**：这里按 Python 状态分支并可能重新分配，
+        放进图里会让 T 每增长一次就 guard 失败重编译。按 2 的幂扩容，避免
+        序列变长时频繁重分配。
+        """
         if self._position_ids is None or self._position_ids.shape[1] < token_num:
+            capacity = 1 << max(token_num - 1, 63).bit_length()
             self._position_ids = torch.arange(
-                max(token_num, 64), dtype=torch.int32, device=self.device
+                capacity, dtype=torch.int32, device=self.device
             ).unsqueeze(0)
-        return self._position_ids[:, :token_num].contiguous()
+        return self._position_ids[:, :token_num]
 
     # ---------------------------------------------------------------- mixers
 
@@ -120,7 +145,12 @@ class Qwen35Runner:
         return out
 
     def _attention(
-        self, h: torch.Tensor, w: AttnLayerWeights, trace: dict | None, tag: str
+        self,
+        h: torch.Tensor,
+        w: AttnLayerWeights,
+        pos: torch.Tensor,
+        trace: dict | None,
+        tag: str,
     ):
         token_num = h.shape[0]
         nh = self.w.num_attention_heads
@@ -136,7 +166,6 @@ class Qwen35Runner:
         q = qwen_rmsnorm(q_raw.view(token_num, nh, d), w.q_norm, self.eps)
         k = qwen_rmsnorm(k_raw.view(token_num, nkv, d), w.k_norm, self.eps)
 
-        pos = self._positions(token_num)
         # [T,H,D] -> [1,H,T,D]
         q4 = partial_rope(
             q.unsqueeze(0).permute(0, 2, 1, 3), pos, self.inv_freq, self.w.rotary_dim
@@ -175,8 +204,34 @@ class Qwen35Runner:
         trace: dict | None = None,
         trace_layers: set[int] | None = None,
     ) -> torch.Tensor:
-        """input_ids: [T] int32/int64 -> final norm 之后的 hidden [T,1024] BF16。"""
+        """input_ids: [T] int32/int64 -> final norm 之后的 hidden [T,1024] BF16。
+
+        传了 trace 就走 eager——往 dict 里塞中间量没法编译，而且逐算子对拍本来
+        就要的是与 Hugging Face 一致的那条路径。
+        """
         assert input_ids.ndim == 1
+        pos = self._positions(input_ids.shape[0])
+
+        if trace is None and self._compiled is not None:
+            if not self._compile_announced:
+                self._compile_announced = True
+                print(
+                    "[runner] torch.compile 启动中：热缓存约 4.8s，冷缓存约 2 分钟。"
+                    "之后 6.4ms/forward（eager 41ms）。生成不到 ~137 个 token 时"
+                    "eager 更快，传 compile=False 即可。",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            return self._compiled(input_ids, pos, None, None)
+        return self._forward(input_ids, pos, trace, trace_layers)
+
+    def _forward(
+        self,
+        input_ids: torch.Tensor,
+        pos: torch.Tensor,
+        trace: dict | None,
+        trace_layers: set[int] | None,
+    ) -> torch.Tensor:
         if trace_layers is None:
             trace_layers = {0, 3}
 
@@ -196,7 +251,7 @@ class Qwen35Runner:
             if isinstance(layer, GDNLayerWeights):
                 h = self._gdn(h, layer, inner, tag)
             else:
-                h = self._attention(h, layer, inner, tag)
+                h = self._attention(h, layer, pos, inner, tag)
             x = residual_add(h, residual)
 
             residual = x
@@ -245,8 +300,12 @@ class Qwen35Runner:
         return generated
 
 
-def build_runner(model_dir: str = "Qwen3.5-0.8B", device: str = "cuda") -> Qwen35Runner:
-    return Qwen35Runner(load_text_weights(model_dir, device))
+def build_runner(
+    model_dir: str = "Qwen3.5-0.8B",
+    device: str = "cuda",
+    compile: bool = True,
+) -> Qwen35Runner:
+    return Qwen35Runner(load_text_weights(model_dir, device), compile=compile)
 
 
 if __name__ == "__main__":
