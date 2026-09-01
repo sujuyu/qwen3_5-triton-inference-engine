@@ -149,6 +149,15 @@ def main() -> None:
     free_store: dict[str, torch.Tensor] = {}
     patch_free_functions(free_store)
 
+    # 最后一层的原始输出（final norm 之前），hidden_states 里拿不到。
+    last_layer_out: dict[str, torch.Tensor] = {}
+
+    def _last_layer_hook(_mod, _args, output):
+        tensor = output[0] if isinstance(output, (tuple, list)) else output
+        last_layer_out["value"] = tensor.detach().float().cpu()
+
+    handles.append(layers[-1].register_forward_hook(_last_layer_hook))
+
     with torch.no_grad():
         out = model(
             input_ids=input_ids,
@@ -169,14 +178,18 @@ def main() -> None:
         "需要重新确认 patch 点"
     )
 
+    # hidden_states 的索引：hidden_{i+1} = 第 i 层的输出，i = 0..22。
+    # 但**最后一个是 final norm 之后**（RMS 会跳一个量级），不是第 23 层的原始输出，
+    # 所以第 23 层的原始输出要靠单独的 hook 拿，别对 hidden_states[-1] 再 norm 一次。
     hidden = {
         f"hidden_{i:02d}": h.detach().float().cpu()
         for i, h in enumerate(out.hidden_states)
     }
-    with torch.no_grad():
-        hidden["final_norm"] = (
-            text_model.norm(out.hidden_states[-1]).detach().float().cpu()
-        )
+    hidden["final_norm"] = out.hidden_states[-1].detach().float().cpu()
+    hidden["layer23_out"] = last_layer_out["value"]
+    assert hidden["layer23_out"].pow(2).mean().sqrt() < hidden["final_norm"].pow(
+        2
+    ).mean().sqrt(), "layer23 原始输出的 RMS 应明显小于 norm 之后"
 
     logits_last = out.logits[0, -1].detach().float().cpu()
     greedy_first = int(logits_last.argmax())

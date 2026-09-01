@@ -83,7 +83,16 @@ out = x @ weight.T
 
 FP32 accumulate，要求 `K % 128 == 0`。可以覆盖当前文本模型的投影尺寸。
 
-当前自测只覆盖 `(M,K,N)=(1,128,128)`，后续应补真实尺寸，例如 K 为 1024、2048、3584，N 为 16、512、1024、2048、3584、4096、6144、248320。这是目前测试覆盖最薄弱的一个 kernel。
+kernel 自带的自测只覆盖 `(M,K,N)=(1,128,128)`。真实尺寸的覆盖放在 `tests/test_gemm_model_shapes.py`（不改动 kernel 本体）：7 组 `(K,N)` × 4 组 `T`，共 28 组全部通过，相对误差 ≤ 0.46%，与 BF16 输出舍入一致。
+
+```text
+K=1024: N ∈ {16, 512, 2048, 3584, 6144}
+K=2048: N = 1024
+K=3584: N = 1024
+T ∈ {1, 19, 65, 129}
+```
+
+`N=248320` 的 LM head 不走这个 kernel，由 `vocab_argmax.py` 融合处理。
 
 ### 3.2 `qwen_rmsnorm.py` — `wy_lib::qwen_rmsnorm`
 
@@ -95,7 +104,7 @@ y = x * rsqrt(mean(x^2) + eps) * (1 + weight)
 
 输入和 weight 均为 BF16，reduction 和乘法使用 FP32。
 
-注意：wrapper 仍然 `assert x.is_contiguous()`。Full-attention 的 q projection 切分后是 strided view，这个冲突尚未解决，见第 4 节。
+注意：wrapper 有 `assert x.is_contiguous()`，是全仓库唯一一个不接受 stride 的 kernel。Full-attention 的 q projection 曾经与它冲突，现已通过 loader 里拆分 `q_proj` 解决（见第 4 节和 7.1），kernel 本体不用改。
 
 这个 kernel 不能用于 GDN 的 gated RMSNorm，后者见 3.11。
 
@@ -146,13 +155,23 @@ kernel 内部根据 position 和 inv_freq 计算 sin/cos，没有保存全长度
 
 ```text
 attention_out: [B,H,T,D] BF16
-gate:          [B,T,H,D] BF16
+gate:          [B,H,T,D] BF16   ← 形状，不是内存布局
 out:           [B*T,H*D] BF16，连续布局
 
-out[t,h*D+d] = attention_out[0,h,t,d] * sigmoid(gate[0,t,h,d])
+out[t,h*D+d] = attention_out[b,h,t,d] * sigmoid(gate[b,h,t,d])
 ```
 
-pack 同时完成 `[B,H,T,D] -> [B,T,H,D] -> [B*T,H*D]`，输出直接传给 `o_proj` GEMM。
+**两个参数都按 `[B,H,T,D]` 索引**，wrapper 里有 `assert x.shape == gate.shape`。gate 在
+上游的自然内存布局是 `[B,T,H,D]`，所以调用方要传 permute 出来的 view，而不是直接传
+`[B,T,H,D]` 形状的张量：
+
+```python
+gate4 = gate.view(1, T, H, D).permute(0, 2, 1, 3)   # [1,H,T,D]，strided
+packed = attention_gate_pack(ctx, gate4)
+```
+
+kernel 是 stride-aware 的，permute 不产生拷贝。pack 同时完成 `[B,H,T,D] -> [B*T,H*D]` 的
+转置重排，输出直接传给 `o_proj` GEMM。
 
 已使用非连续 `[B,H,T,D]` stride 输入测试 `T=1,3,17,65,129`，最大绝对误差均为 0。Triton 3.7 的 `tl.sigmoid` 要求 FP32，因此 gate 在 kernel 内显式转为 FP32。
 
@@ -350,11 +369,11 @@ residual_add
 
 切出来的 `q` 是 strided view，而 `qwen_rmsnorm` 目前 `assert x.is_contiguous()`。这是整个 runner 里**唯一**的布局冲突点：其余 kernel（`partial_rope`、`gqa_attention`、`attention_gate_pack`、`swiglu`、`gemm_2d`、`conv4`、`gdn_*`）都已经是 stride-aware，`residual_add` 虽然要 contiguous 但它的两个输入天然连续。
 
-注意仅仅"重排 `q_proj` 的行"并不够：即使把全部 Q 排到前 2048 行，`out[:, :2048].view(T,8,256)` 的 stride 仍然是 `(4096,256,1)`，依旧非连续。可行方案：
+注意仅仅"重排 `q_proj` 的行"并不够：即使把全部 Q 排到前 2048 行，`out[:, :2048].view(T,8,256)` 的 stride 仍然是 `(4096,256,1)`，依旧非连续。
 
-1. **loader 里把 `q_proj.weight` 拆成两个独立张量**：按行 gather 出 `q_proj_q [2048,1024]`（行号 `h*512 + i`）和 `q_proj_gate [2048,1024]`（行号 `h*512+256+i`），各做一次 GEMM。两个输出都是连续的 `[T,2048]`，`view(T,8,256)` 连续，现有 kernel 一行不用改。代价是 2 次 GEMM launch 代替 1 次，FLOPs 不变。（推荐）
-2. 显式 `.contiguous()`，多一次拷贝。
-3. 参照 `gdn_gated_rmsnorm.py` 的写法给 `qwen_rmsnorm` 加 3D stride 支持——kernel 里其实已经有 `x_stride_m/x_stride_n` 参数，只是 wrapper 把它们硬写成 `d_model` 和 `1`；但单个 `stride_m` 表达不了 `[T,8,256]` 这种两级行结构，需要改成 `(t,h,d)` 三维 stride + 二维 grid。
+**已采用方案 1**（实现在 `engine/loader.py`，见 7.1）：loader 里把 `q_proj.weight` 拆成两个独立张量——按行 gather 出 `q_proj_q [2048,1024]`（行号 `h*512 + i`）和 `q_proj_gate [2048,1024]`（行号 `h*512+256+i`），各做一次 GEMM。两个输出都是连续的 `[T,2048]`，`view(T,8,256)` 连续，现有 kernel 一行不用改。代价是 2 次 GEMM launch 代替 1 次，FLOPs 不变。
+
+当时考虑过但没采用的：显式 `.contiguous()`（多一次运行时拷贝）；给 `qwen_rmsnorm` 加 3D stride 支持（kernel 里已有 `x_stride_m/x_stride_n` 参数，只是 wrapper 硬写成 `d_model` 和 `1`，但单个 `stride_m` 表达不了 `[T,8,256]` 这种两级行结构，要改成 `(t,h,d)` 三维 stride + 二维 grid）。后者更通用，如果哪天想省掉那次额外的 GEMM launch 可以回头做。
 
 K 路径没有这个问题：`k_proj` 输出 `[T,512]` 连续，`view(T,2,256)` 也连续。
 
@@ -434,12 +453,19 @@ n = n * silu(z_fp32)
 
 ```text
 meta.pt           input_ids、rendered prompt、生成的 32 个 token
-hidden.pt         embedding 输出 + 24 层每层输出 + final norm，共 26 个 [1,19,1024]
+hidden.pt         hidden_00..hidden_24 + layer23_out + final_norm
 layer00_gdn.pt    第 0 层（GDN）39 个中间量
 layer03_attn.pt   第 3 层（full attention）36 个中间量
 logits.pt         最后一个位置的 logits [248320] 和 greedy token
 index.json        全部 key 的清单
 ```
+
+**`hidden_states` 的索引有个坑**：`hidden_00` 是 embedding 输出，`hidden_{i+1}` 是第 i 层的输出——但**只到 i=22**。`hidden_24` 已经是 final norm 之后的值（RMS 从 0.296 跳到 4.105），不是第 23 层的原始输出。所以：
+
+- 第 23 层的原始输出由单独的 hook 存成 `layer23_out`；
+- `final_norm` 就等于 `hidden_24`，不要再对它 norm 一次。
+
+（第一版 dump 脚本正是对 `hidden_states[-1]` 又调了一次 `norm`，导致对拍时最后两项显示 90% / 33% 的假误差。）
 
 模型以 `attn_implementation="eager"` 加载，避免落到 flash/sdpa 的融合分支。
 
@@ -487,28 +513,98 @@ text = "你好！我是 Qwen3.5，由阿里巴巴集团旗下的通义实验室�
 
 推论：单算子对拍容差按 BF16 量级设（相对误差 ~1%）；真正该盯死的是 **greedy token 序列完全一致**，以及逐层误差不随层数放大。近似平局时 argmax 可能被这些差异翻转，如果 token 序列在某一步分叉，先看那一步 top-2 的 logit 间距。
 
-## 7. 剩余工作
+## 7. 引擎实现
 
-原计划的前四项（GDN sequential delta rule、GDN gated RMSNorm、embedding gather、LM head + argmax）已全部完成，额外完成了计划外的 chunk-64 prefill 和 GDN decode，数值 oracle 也已就位（第 6 节）。
+### 7.1 `engine/loader.py`
 
-**完整重算路径所需的 kernel 已经齐了**——embedding gather → RMSNorm → GEMM → GDN 全链 / full-attn 全链 → SwiGLU → residual → LM head+argmax，没有缺口。剩下的按建议顺序：
+`load_text_weights(model_dir, device) -> TextWeights`。只读 `model.language_model.*`，视觉塔和 MTP 的张量根本不 `get_tensor`，不占显存。实测加载 1.43s、1.426 GiB。
 
-1. **补 `gemm_2d` 的真实尺寸测试**。runner 每一层都在用它，但只测过 `(1,128,128)`。真实尺寸 K∈{1024,2048,3584}、N∈{16,512,1024,2048,3584,4096,6144}，都满足 `K%128==0`。独立、便宜，先做。
-2. **权重加载器**。Safetensors 解析，只加载 `model.language_model.*`，显式跳过 `model.visual.*` 和 `mtp.*`（张量名前缀已核对 `model.safetensors.index.json`，见 8.1）。断言：文本主干 `752,393,024` 参数、18 个 GDN 层、6 个 full-attention 层；`A_log[16]` 和 `linear_attn.norm.weight[128]` 必须按 FP32 读取；checkpoint 里**没有** `lm_head.weight`，必须复用 `embed_tokens.weight`。同时按第 4 节把 `q_proj.weight` 拆成 Q / gate 两个张量。
-3. **单层对拍**。先只跑第 0 层（GDN）和第 3 层（full attention），逐算子对 `oracle/layer00_gdn.pt` 和 `oracle/layer03_attn.pt`。布局 bug 会在这里全部暴露，比 24 层一起上好查得多。容差按 6.3 的说明设。
-4. **24 层完整 runner**。走完整重算路径，对 `oracle/hidden.pt` 的 26 个逐层输出，最后对 greedy token 序列。
-5. `depthwise_causal_conv4_decode`：维护 `[6144,4]` conv state，移位/环形更新后做 4-tap dot product。
-6. 带 KV cache 的 GQA decode kernel：只算新 query 对全部历史 K/V。
-7. 有了 5、6 之后接 GDN 的 `gdn_recurrent_decode`，把 runner 切成 prefill + 增量 decode 两条路径，并验证与完整重算等价。
-8. 性能收尾：`gemm_2d` 的 tuning、`prepare_wy` 的 DK/DV 分块、`chunk_state`/`chunk_output` 的 BLOCK_V autotune、`gdn_qk_norm_gates` 的 head 分块。
+权重按层类型分成 `GDNLayerWeights` / `AttnLayerWeights` 两个 frozen dataclass，字段名与 checkpoint 张量名一一对应。
 
-MVP 阶段 GDN 建议先走 sequential 路径——它是自己写的、验证过，也是 chunked 的对拍基准；正确性打通后再切 chunk-64。
+两处不是原样搬运：
 
-host 侧还需要：position ids、停止条件（`<|im_end|>` = 248046 与 `<|endoftext|>` = 248044 由调用层配置）、以及 tokenizer 接入——`tokenize_text.py` 目前用 `tokenizers` 库跑通了单轮 chat template，够第一版用。
+1. **`q_proj.weight [4096,1024]` 拆成 `q_proj_q` 和 `q_proj_gate` 各 `[2048,1024]`**，按第 4 节的方案。行布局是 head-major，第 h 个 head 占 `[h*512, h*512+512)`，前 256 行 Q、后 256 行 gate；拆完保持 head 顺序，两个输出都 `.contiguous()`。这样 runner 里 `view(T,8,256)` 连续，能直接喂 `qwen_rmsnorm`。
+2. `conv1d.weight [6144,1,4]` squeeze 成 `[6144,4]`。
 
-## 8. 权重与运行环境
+dtype **只断言不转换**——`A_log` 和 `linear_attn.norm.weight` 必须是 FP32，`dt_bias` 必须是 BF16。静默 cast 会掩盖上游改动。
 
-### 8.1 Checkpoint 张量名
+收尾断言：18 GDN + 6 attn 层；所有 `model.language_model.*` 张量一个不漏地被读到；未读的必须全部落在 `model.visual.` / `mtp.` 前缀内（即"跳过是有意的"）；参数量恰好 `752,393,024`；checkpoint 里不存在独立 `lm_head`。
+
+```bash
+python engine/loader.py    # 打印摘要并跑全部断言
+```
+
+### 7.2 `engine/runner.py`
+
+`Qwen35Runner`，完整重算路径：
+
+```python
+runner = build_runner()                      # 或 Qwen35Runner(load_text_weights())
+tokens = runner.generate(input_ids, max_new_tokens=32)
+```
+
+- `forward(input_ids, trace=None, trace_layers={0,3}) -> [T,1024]`，返回 final norm 之后的 hidden。传 `trace` 字典即可捞出中间量，逐层对拍就是靠它，不需要在 runner 里插调试代码。
+- `next_token()` 完整重算一次并返回 greedy token；`generate()` 套循环，默认停止 token 为 `<|im_end|>`(248046) 和 `<|endoftext|>`(248044)。
+
+实测 19 token prompt 生成 32 token 耗时 35s（约 1.09 s/token）——完整重算 + 逐 token GDN sequential，慢是预期内的，这一版只追求正确性。
+
+```bash
+python engine/runner.py    # 端到端跑一遍并打印生成结果
+```
+
+### 7.3 对拍结果
+
+```bash
+python tests/test_gemm_model_shapes.py   # gemm_2d 真实尺寸，28 组
+python tests/test_oracle_parity.py       # 对 oracle 逐算子 + 端到端，49 项
+```
+
+`tests/test_oracle_parity.py` 的结果（2026-09-01，A100）：
+
+```text
+逐算子检查 49 项，超容差 0 项
+最大相对误差            layer15.out = 3.94%
+逐层 hidden 相对误差    首层 0.40% -> 末层 1.11%（不发散）
+端到端 greedy           32 个 token 与 oracle 逐个相同
+```
+
+关键的几个算子级锚点：
+
+```text
+layer00 conv(+silu)            0.31%
+layer00 delta rule 输出         0.43%
+layer00 gated rmsnorm          0.61%
+layer03 q_proj 拆分后 Q/gate    0.49% / 0.99%
+layer03 rope_q / rope_k        0.89% / 0.69%
+layer03 gated pack             0.98%
+```
+
+误差量级与 6.3 描述的 BF16 舍入一致，没有出现单点突变。
+
+## 8. 剩余工作
+
+**正确性里程碑已达成**：13 个 kernel + loader + runner 打通，端到端 greedy 32 个 token 与 Hugging Face 逐个相同，49 项逐算子对拍全部在容差内（第 7 节）。
+
+已完成的：全部 kernel、`gemm_2d` 真实尺寸测试、数值 oracle、权重加载器、单层对拍、24 层完整重算 runner。
+
+剩下的按建议顺序：
+
+1. **切增量 decode**。当前 1.09 s/token，瓶颈是每步都对整个序列重算。需要三件东西：
+   - `depthwise_causal_conv4_decode`：维护 `[6144,4]` conv state，移位/环形更新后做 4-tap dot product；
+   - 带 KV cache 的 GQA decode kernel：只算新 query 对全部历史 K/V；
+   - GDN 侧直接接已有的 `gdn_recurrent_decode`（state cache 路径已验证）。
+
+   齐了之后把 runner 拆成 prefill + decode 两条路径，用当前的完整重算版本做等价性对拍——**现在这个 runner 就是那个基准**。
+2. **prefill 切 chunk-64**。当前 GDN 走 sequential，长 prompt 会明显偏慢。切换成本很低（`call_gdn_recurrent_prefill_chunked_triton` 与 sequential 接口完全一致），但 chunk 那条路径是 Codex 写的、没逐行审过，切之前值得过一遍代码；`tests/test_oracle_parity.py` 可以直接复用作回归。
+3. **性能收尾**：`gemm_2d` 的 tuning、`prepare_wy` 的 DK/DV 分块、`chunk_state`/`chunk_output` 的 BLOCK_V autotune、`gdn_qk_norm_gates` 的 head 分块。
+4. **扩测试覆盖**：目前 oracle 只有一个 19 token 的中文 prompt。至少再加一个长 prompt（跨过 chunk-64 边界，比如 T=65/129）和一个英文 prompt。
+5. 可选：top-k/top-p/temperature sampling、batch/padding。
+
+host 侧还缺的：`tokenize_text.py` 目前只实现了单轮 non-thinking chat 模板的子集，多轮对话和 thinking 模式要补。停止 token（`<|im_end|>`=248046、`<|endoftext|>`=248044）已经在 runner 里作为默认值。
+
+## 9. 权重与运行环境
+
+### 9.1 Checkpoint 张量名
 
 本地 checkpoint 为单文件 `Qwen3.5-0.8B/model.safetensors-00001-of-00001.safetensors`，索引在 `model.safetensors.index.json`。三个顶层命名空间：
 
@@ -559,7 +655,7 @@ full-attention 层（i ∈ {3,7,11,15,19,23}）额外有：
 
 所有线性层都没有 bias；名字里唯一带 bias 的是 GDN 的 `dt_bias`，它是 softplus 的偏置，不是 GEMM bias。以上形状和 dtype 已直接从 safetensors header 核对。
 
-### 8.2 环境
+### 9.2 环境
 
 已确认环境：
 
@@ -595,6 +691,15 @@ python triton_kernels/embedding_gather.py
 python triton_kernels/vocab_argmax.py
 ```
 
+引擎和对拍：
+
+```bash
+python engine/loader.py                   # 权重加载 + 全部断言
+python engine/runner.py                   # 端到端生成 32 token
+python tests/test_gemm_model_shapes.py    # gemm_2d 真实尺寸，28 组
+python tests/test_oracle_parity.py        # 对 oracle 逐算子 + 端到端，49 项
+```
+
 `gdn_recurrent_prefill.py` 跑得最久（chunk + sequential + decode 三组，含 autotune）。
 
 修改 kernel 后至少执行：
@@ -604,7 +709,7 @@ python -m py_compile triton_kernels/<file>.py
 python triton_kernels/<file>.py
 ```
 
-## 9. 协作偏好
+## 10. 协作偏好
 
 用户有 kernel 经验，希望沟通简洁：默认只说明输入、输出、运算逻辑和必要的布局/精度问题。
 
