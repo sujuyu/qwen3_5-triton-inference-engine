@@ -40,11 +40,6 @@ import triton.language as tl
 
 CONV_KERNEL_SIZE = 4
 
-# 写完 _depthwise_causal_conv4_decode_triton 的 body 之后把这里改成 True，
-# __main__ 的第 2 段测试就会跑起来。判断放在 python wrapper 里而不是 kernel 里，
-# 因为 `raise` 不是合法的 Triton AST 节点。
-KERNEL_IMPLEMENTED = False
-
 
 autotune_configs = [
     triton.Config({"BLOCK_D": 256}, num_warps=4, num_stages=1),
@@ -78,36 +73,47 @@ def _depthwise_causal_conv4_decode_triton(
     K: tl.constexpr,  # = CONV_KERNEL_SIZE = 4
     BLOCK_D: tl.constexpr,
 ):
-    # TODO(kernel): 这里留给你写。结构大致是：
-    #
-    #   pid = tl.program_id(0)
-    #   offset_d = pid * BLOCK_D + tl.arange(0, BLOCK_D)
-    #   mask = offset_d < D
-    #
-    #   1. 读 x[offset_d] 和 state 的 4 列
-    #   2. 左移：新 state 的第 r 列 = 旧 state 的第 r+1 列（r<3），第 3 列 = x
-    #   3. acc = sum_r weight[:,r] * new_state[:,r]，FP32 累加
-    #   4. silu：Triton 3.7 的 tl.sigmoid 要求 FP32，acc 保持 FP32 即可
-    #   5. 把 new_state 写回 state_ptr，把 y 写到 out_ptr
-    #
-    # 不需要 concat：`tl.cat` 在这里用不了（[BLOCK_D,3] 的 3 不是 2 的幂，
-    # 会报 "Shape element 1 must be a power of 2"），而且移位本来就等价于变量重命名。
-    #
-    # 方案 A（K=4 展开成 4 个标量列，推荐）：
-    #   s1,s2,s3 = state 的第 1,2,3 列（第 0 列是 x[t-4]，直接不 load）
-    #   xv       = x
-    #   acc = w0*s1 + w1*s2 + w2*s3 + w3*xv        ← 移位后的点乘求和
-    #   写回时目标下标各减 1：0<-s1, 1<-s2, 2<-s3, 3<-xv
-    #
-    # 方案 B（二维，用带偏移的再次 load 代替 concat）：
-    #   kk = tl.arange(0, 4)
-    #   shifted = tl.load(..., (kk+1)*stride_k, mask=kk<3, other=0.0)
-    #   new = tl.where(kk[None,:] < 3, shifted, xv[:,None])
-    #   acc = tl.sum(new.to(tl.float32) * w.to(tl.float32), axis=1)
-    #
-    # 注意 depthwise 通道之间不混合，**不要用 tl.dot**；acc 保持 FP32，
-    # Triton 3.7 的 tl.sigmoid 要求 FP32。
-    tl.static_assert(K == 4, "本 kernel 只针对 conv_kernel_size=4 特化")
+
+    pid = tl.program_id(0)
+    offset_d = pid * BLOCK_D + tl.arange(0, BLOCK_D)
+    mask = offset_d < D
+
+    x = tl.load(x_ptr + offset_d * stride_x_d, mask=mask, other=0.0).to(tl.float32)
+    s1 = tl.load(state_ptr + offset_d * stride_state_d + 1 * stride_state_k, mask=mask, other=0.0).to(tl.float32) # x[t-3]
+    s2 = tl.load(state_ptr + offset_d * stride_state_d + 2 * stride_state_k, mask=mask, other=0.0).to(tl.float32) # x[t-2]
+    s3 = tl.load(state_ptr + offset_d * stride_state_d + 3 * stride_state_k, mask=mask, other=0.0).to(tl.float32) # x[t-1]
+
+    w0 = tl.load(weight_ptr + offset_d * stride_w_d + 0 * stride_w_k, mask=mask, other=0.0).to(tl.float32)
+    w1 = tl.load(weight_ptr + offset_d * stride_w_d + 1 * stride_w_k, mask=mask, other=0.0).to(tl.float32)
+    w2 = tl.load(weight_ptr + offset_d * stride_w_d + 2 * stride_w_k, mask=mask, other=0.0).to(tl.float32)
+    w3 = tl.load(weight_ptr + offset_d * stride_w_d + 3 * stride_w_k, mask=mask, other=0.0).to(tl.float32)
+
+    # 4 个 tap 的求和就在这一行里完成，acc 已经是 [BLOCK_D]，后面不要再 reduce
+    acc = (s1 * w0 + s2 * w1 + s3 * w2 + x * w3)
+
+    # 写回state：读的下标比写的下标各大 1，就是左移一格
+    tl.store(
+        state_ptr + offset_d * stride_state_d + 0 * stride_state_k,
+        s1.to(tl.bfloat16), mask=mask
+    )
+    tl.store(
+        state_ptr + offset_d * stride_state_d + 1 * stride_state_k,
+        s2.to(tl.bfloat16), mask=mask
+    )
+    tl.store(
+        state_ptr + offset_d * stride_state_d + 2 * stride_state_k,
+        s3.to(tl.bfloat16), mask=mask
+    )
+    tl.store(
+        state_ptr + offset_d * stride_state_d + 3 * stride_state_k,
+        x.to(tl.bfloat16), mask=mask
+    )
+
+    acc = acc * tl.sigmoid(acc) # SiLU，与 prefill 版写法一致；acc 已是 FP32
+
+    tl.store(
+        out_ptr + offset_d * stride_o_d, acc.to(tl.bfloat16), mask=mask
+    )
 
 
 @torch.library.triton_op(
@@ -119,11 +125,6 @@ def depthwise_causal_conv4_decode(
     state: torch.Tensor,
     weight: torch.Tensor,
 ) -> torch.Tensor:
-    if not KERNEL_IMPLEMENTED:
-        raise NotImplementedError(
-            "_depthwise_causal_conv4_decode_triton 的 body 还没写；"
-            "写完后把本文件顶部的 KERNEL_IMPLEMENTED 改成 True"
-        )
     assert x.ndim == 2 and x.shape[0] == 1, "decode 每次只处理一个 token"
     assert state.ndim == 2
     assert weight.ndim in (2, 3)
@@ -253,52 +254,48 @@ if __name__ == "__main__":
 
     # ---- 第 2 步：Triton kernel vs 参考实现 -------------------------------
     print("=== Triton kernel vs 参考实现 ===")
-    try:
-        for token_num, prefix in ((4, 2), (17, 5), (65, 33)):
-            x = torch.randn(
-                (token_num, hidden_dim), dtype=torch.bfloat16, device="cuda"
-            )
-            weight = torch.randn(
-                (hidden_dim, 1, CONV_KERNEL_SIZE),
-                dtype=torch.bfloat16,
-                device="cuda",
-            )
-            expected = depthwise_causal_conv4_prefill(x, weight)
-
-            state = conv_state_from_prefill(x[:prefix])
-            parts = [depthwise_causal_conv4_prefill(x[:prefix], weight)]
-            for t in range(prefix, token_num):
-                # 注意这个 op 会就地改写 state
-                parts.append(
-                    call_depthwise_causal_conv4_decode_triton(
-                        x[t : t + 1], state, weight
-                    )
-                )
-            actual = torch.cat(parts, dim=0)
-
-            err = (actual.float() - expected.float()).abs().max().item()
-            torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
-            assert torch.isfinite(actual).all()
-            print(
-                f"  T={token_num:>3} prefix={prefix:>2}  max_abs_error={err:.8f}  "
-                f"best_config={_depthwise_causal_conv4_decode_triton.best_config}"
-            )
-
-        # 通用尺寸，确认没有把 D=6144 写死
-        x = torch.randn((1, 1000), dtype=torch.bfloat16, device="cuda")
-        state = torch.randn(
-            (1000, CONV_KERNEL_SIZE), dtype=torch.bfloat16, device="cuda"
+    for token_num, prefix in ((4, 2), (17, 5), (65, 33)):
+        x = torch.randn(
+            (token_num, hidden_dim), dtype=torch.bfloat16, device="cuda"
         )
         weight = torch.randn(
-            (1000, CONV_KERNEL_SIZE), dtype=torch.bfloat16, device="cuda"
+            (hidden_dim, 1, CONV_KERNEL_SIZE),
+            dtype=torch.bfloat16,
+            device="cuda",
         )
-        expected_out, expected_state = _torch_reference(x, state.clone(), weight)
-        actual_out = call_depthwise_causal_conv4_decode_triton(x, state, weight)
-        torch.testing.assert_close(actual_out, expected_out, rtol=2e-2, atol=2e-2)
-        torch.testing.assert_close(state, expected_state)
-        print("  D=1000 通用尺寸通过，且 state 已就地更新")
+        expected = depthwise_causal_conv4_prefill(x, weight)
 
-        print("All depthwise causal conv4 decode tests passed.")
-    except NotImplementedError as exc:
-        print(f"  跳过：{exc}")
-        print("  填完 _depthwise_causal_conv4_decode_triton 的 body 后重跑本文件。")
+        state = conv_state_from_prefill(x[:prefix])
+        parts = [depthwise_causal_conv4_prefill(x[:prefix], weight)]
+        for t in range(prefix, token_num):
+            # 注意这个 op 会就地改写 state
+            parts.append(
+                call_depthwise_causal_conv4_decode_triton(
+                    x[t : t + 1], state, weight
+                )
+            )
+        actual = torch.cat(parts, dim=0)
+
+        err = (actual.float() - expected.float()).abs().max().item()
+        torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+        assert torch.isfinite(actual).all()
+        print(
+            f"  T={token_num:>3} prefix={prefix:>2}  max_abs_error={err:.8f}  "
+            f"best_config={_depthwise_causal_conv4_decode_triton.best_config}"
+        )
+
+    # 通用尺寸，确认没有把 D=6144 写死
+    x = torch.randn((1, 1000), dtype=torch.bfloat16, device="cuda")
+    state = torch.randn(
+        (1000, CONV_KERNEL_SIZE), dtype=torch.bfloat16, device="cuda"
+    )
+    weight = torch.randn(
+        (1000, CONV_KERNEL_SIZE), dtype=torch.bfloat16, device="cuda"
+    )
+    expected_out, expected_state = _torch_reference(x, state.clone(), weight)
+    actual_out = call_depthwise_causal_conv4_decode_triton(x, state, weight)
+    torch.testing.assert_close(actual_out, expected_out, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(state, expected_state)
+    print("  D=1000 通用尺寸通过，且 state 已就地更新")
+
+    print("All depthwise causal conv4 decode tests passed.")

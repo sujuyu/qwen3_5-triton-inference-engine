@@ -16,7 +16,7 @@
 
 模型文件位于 `Qwen3.5-0.8B/`。完整模型结构和算子调研见 `README.md`；README 中第 3 节（视觉塔）、第 4 节（MTP）以及算子清单里标记为 `V` 的条目当前都不在范围内。
 
-关于 cache 的现状：kernel 层面 GDN 的 recurrent state cache 路径已经打通（`gdn_recurrent_decode` 原地更新 `[H,128,128]` FP32 state，并已验证「prefill 前缀 + 逐 token decode」与整段 sequential 结果一致）；但 GDN conv state cache 和 full attention 的 KV cache 都还没有 kernel。因此第一版 runner 仍按「每生成一个 token，对增长后的完整序列重新执行一次 forward」实现，等三类 cache 齐备后再切到增量 decode。
+关于 cache 的现状：GDN 两个 cache 的 decode kernel 都已就位——`gdn_recurrent_decode` 原地更新 `[16,128,128]` FP32 recurrent state（3.10b），`depthwise_causal_conv4_decode` 原地更新 `[6144,4]` BF16 conv state（3.8b），两者都验证过「prefill 前缀 + 逐 token decode」与整段 prefill 一致。**还差 full attention 的 KV cache**，缺了它 runner 就切不到增量 decode，所以当前仍按「每生成一个 token，对增长后的完整序列重新执行一次 forward」实现。
 
 无论走哪条路，Gated DeltaNet 在单次 forward 内必须按 token 顺序维护 recurrent state；完整重算时从零状态开始。
 
@@ -69,7 +69,7 @@ conv kernel      = 4（depthwise，6144 通道）
 
 ## 3. 已有 kernel
 
-共 13 个文件，全部位于 `triton_kernels/`，全部已有 autotune（少数固定配置）、`torch.library.triton_op` 封装、`register_fake` 和 PyTorch reference，且自测通过。注册的 op 命名空间统一为 `wy_lib::`。
+共 14 个文件，全部位于 `triton_kernels/`，全部已有 autotune（少数固定配置）、`torch.library.triton_op` 封装、`register_fake` 和 PyTorch reference，且自测通过。注册的 op 命名空间统一为 `wy_lib::`。
 
 ### 3.1 `gemm_2d.py` — `wy_lib::gemm_2d`
 
@@ -205,7 +205,50 @@ out:    [T,D] BF16
 
 depthwise causal Conv4 融合 SiLU。已测试 `T=1,2,3,4,17,65`、模型 `D=6144` 和通用 `D=1000`，最大绝对误差 `0.015625`。
 
-对应的 decode 版本（维护 `[6144,4]` conv state）尚未实现。
+### 3.8b `depthwise_causal_conv4_decode.py` — `wy_lib::depthwise_causal_conv4_decode`
+
+3.8 的 decode 版，维护 GDN 的 conv state。
+
+```text
+x:      [1,D] BF16      新 token 的 in_proj_qkv 输出，模型 D=6144
+state:  [D,4] BF16      原地更新
+weight: [D,1,4] 或 [D,4] BF16    与 prefill 版共用同一份权重
+out:    [1,D] BF16      含 SiLU
+```
+
+conv kernel size 是 4，算 `y[t]` 要用 `x[t-3..t]`，decode 时只有 `x[t]` 是新的，
+前三个从 state 取。**注意这与 delta rule 的 `[16,128,128]` recurrent state 是两个
+独立的 cache**，GDN 每层两个都要。state 存的是 **conv 的输入**（`in_proj_qkv` 的输出），
+不是 conv 输出、也不是 SiLU 之后的值。18 层合计 0.84 MiB。
+
+约定对齐 transformers 的 `causal_conv1d_update`（`state_len = conv_kernel_size = 4`）：
+更新后 `state[c,:]` 恰好是 `x[t-3..t]`，点积不用再做下标偏移。
+
+```text
+state[c,:] = concat(state[c,1:], x[c])          # 左移一格，新值放末尾
+acc  = sum_{r=0..3} weight[c,r] * state[c,r]    # FP32 累加
+y[c] = acc * sigmoid(acc)
+```
+
+实现上不需要 concat：kernel 里"移位"就是变量重命名（读 state 的第 1/2/3 列，
+写回第 0/1/2 列，第 3 列写新值），第 0 列干脆不读。`tl.cat` 在这里**用不了**——
+`[BLOCK_D,3]` 的 3 不是 2 的幂，会报 `Shape element 1 must be a power of 2`。
+depthwise 通道间不混合，**不要用 `tl.dot`**。
+
+和 `gdn_recurrent_decode` 一样声明了 `mutates_args=("state",)`，autotune 配
+`restore_value=["state_ptr"]`——不加的话调优反复试 config 会把 state 推进多次。
+**调用方要注意这个 op 会就地改写传入的 state。**
+
+配套工具 `conv_state_from_prefill(x) -> [D,4]`：从 prefill 的 conv 输入建初始 state，
+取最后 4 行，`T < 4` 时左侧补零。
+
+测试分两段：先验证 PyTorch 参考实现与 prefill kernel 一致（不依赖 Triton kernel），
+再验证 Triton kernel 与参考实现一致。判据都是「prefill 前 n 个 token → 拿 state →
+逐 token decode 剩下的」必须等于整段 prefill。覆盖 `T=1,2,3,4,17,65`（前四个专门
+覆盖 `T<4` 的左侧补零路径）和通用 `D=1000`，最大绝对误差全部为 0。
+
+访存量只有 `读 9D + 写 5D` ≈ 172 KiB，纯 launch-bound，autotune 选了最小的
+`BLOCK_D=256`；不必在它的 tiling 上花心思。
 
 ### 3.9 `gdn_qk_norm_gates.py` — `wy_lib::gdn_qk_norm_gates`
 
@@ -788,8 +831,7 @@ CPU 停顿。同样地，8.4 表里 T=128 那行的 "forward 总 GPU 20.49ms" �
    得全序列重算；而每层输入依赖上一层所有位置的输出，所以只要有一层要全序列，
    那 6 层 attention 也拿不到"只有一个新 token"的输入：
 
-   - `depthwise_causal_conv4_decode`：维护 `[6144,4]` conv state，移位/环形更新后做
-     4-tap dot product。三件里最小，建议先做；
+   - ~~`depthwise_causal_conv4_decode`~~ **已完成**，见 3.8b；
    - 带 KV cache 的 GQA decode kernel：只算新 query 对全部历史 K/V。**注意它本身不是
      提速手段**——full attention 只占 GPU 时间 2-3% 且不随 T 增长（8.4），做它纯粹
      因为它是 decode 模式的必需件；
@@ -890,6 +932,7 @@ python triton_kernels/attention_gate_pack.py
 python triton_kernels/residual_add.py
 python triton_kernels/swiglu.py
 python triton_kernels/depthwise_causal_conv4_prefill.py
+python triton_kernels/depthwise_causal_conv4_decode.py
 python triton_kernels/gdn_qk_norm_gates.py
 python triton_kernels/gdn_recurrent_prefill.py
 python triton_kernels/gdn_gated_rmsnorm.py
