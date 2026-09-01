@@ -1,0 +1,22 @@
+# 模型 checkpoint：1.7G，其中 model.safetensors 单文件 1.66GB，远超 GitHub 100MB 限制。
+# 从 https://huggingface.co/Qwen/Qwen3.5-0.8B 获取，revision 2fc06364715b967f1860aea9cf38778875588b17
+Qwen3.5-0.8B/
+
+# oracle 参考张量（逐层 hidden、logits 等），体积大且可重新生成
+oracle/
+*.pt
+*.safetensors
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Triton / PyTorch 缓存
+.triton/
+.cache/
+
+# 编辑器
+.vscode/
