@@ -10,7 +10,7 @@ oracle/
 # Python
 __pycache__/
 *.py[cod]
-.venv/
+.venv*/
 venv/
 *.egg-info/
 

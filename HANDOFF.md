@@ -420,24 +420,95 @@ n = n * norm_weight_fp32          # 没有 1 + weight
 n = n * silu(z_fp32)
 ```
 
-## 6. 剩余工作
+## 6. 数值 oracle 与已核实的结构假设
 
-原计划的前四项（GDN sequential delta rule、GDN gated RMSNorm、embedding gather、LM head + argmax）已全部完成，并且额外完成了计划外的 chunk-64 prefill 和 GDN decode。
+### 6.1 oracle 的产生方式
 
-剩下的按建议顺序：
+参考实现是 `transformers 5.16.1`，装在项目内的独立 venv `.venv-oracle/`（用 `--system-site-packages` 复用系统 torch 2.12.1，没有动主环境）。生成脚本是 `tools/dump_oracle.py`：
 
-1. **权重加载器**。Safetensors 解析，只加载 `model.language_model.*`，显式跳过 `model.visual.*` 和 `mtp.*`（张量名前缀已核对 `model.safetensors.index.json`，见 7.1）。断言：文本主干 `752,393,024` 参数、18 个 GDN 层、6 个 full-attention 层；`A_log[16]` 和 `linear_attn.norm.weight[128]` 必须按 FP32 读取；checkpoint 里**没有** `lm_head.weight`，必须复用 `embed_tokens.weight`。同时在这里决定 `q_proj` 是否做行重排（见第 4 节）。
-2. **24 层完整 runner**。按第 4、5 节把已有 kernel 串起来，走完整重算路径，先对齐 Transformers 的逐层 hidden 和 greedy token 序列。
-3. `depthwise_causal_conv4_decode`：维护 `[6144,4]` conv state，移位/环形更新后做 4-tap dot product。
-4. 带 KV cache 的 GQA decode kernel：只算新 query 对全部历史 K/V。
-5. 有了 3、4 之后接 GDN 的 `gdn_recurrent_decode`，把 runner 切成 prefill + 增量 decode 两条路径，并验证与完整重算等价。
-6. 性能收尾：补 `gemm_2d` 的真实尺寸测试和 tuning、`prepare_wy` 的 DK/DV 分块、`chunk_state`/`chunk_output` 的 BLOCK_V autotune、`gdn_qk_norm_gates` 的 head 分块。
+```bash
+.venv-oracle/bin/python tools/dump_oracle.py
+```
+
+产物写到 `oracle/`（已 gitignore，约 11 MB），内容：
+
+```text
+meta.pt           input_ids、rendered prompt、生成的 32 个 token
+hidden.pt         embedding 输出 + 24 层每层输出 + final norm，共 26 个 [1,19,1024]
+layer00_gdn.pt    第 0 层（GDN）39 个中间量
+layer03_attn.pt   第 3 层（full attention）36 个中间量
+logits.pt         最后一个位置的 logits [248320] 和 greedy token
+index.json        全部 key 的清单
+```
+
+模型以 `attn_implementation="eager"` 加载，避免落到 flash/sdpa 的融合分支。
+
+固定 prompt 是 `你好，请简单介绍一下自己。`，套 `tokenize_text.py` 里的单轮 non-thinking chat 模板，共 19 个 token。**端到端验收基准**（两次运行完全一致）：
+
+```text
+greedy_first_token = 109266
+generated = [109266, 6115, 103724, 1167, 16451, 18, 13, 20, 3709, 96336, 110619,
+             97793, 113820, 95974, 96359, 103911, 117356, 95726, 96566, 105019,
+             98277, 103725, 1710, 95815, 98897, 108696, 98277, 98142, 5205,
+             111892, 5205, 104062]
+text = "你好！我是 Qwen3.5，由阿里巴巴集团旗下的通义实验室自主研发的超大规模语言模型。我具备强大的语言理解、推理、对话"
+```
+
+除模块 forward hook 外，脚本还 patch 了三个模块级自由函数（`causal_conv1d_fn`、`torch_chunk_gated_delta_rule`、`apply_rotary_pos_emb`），因为它们不是 `nn.Module.__call__`，hook 抓不到。所以 conv 输出、delta rule 的 q/k/v/beta/g/final_state、RoPE 前后的 q/k 都有独立锚点——某一层对不上时能直接定位到具体算子。
+
+### 6.2 已核实的结构假设
+
+以下全部**既读了 `modeling_qwen3_5.py` 源码，又用 dump 出来的张量做了数值验证**（带反向对照），不再是调研推测：
+
+| 假设 | 结论 | 证据 |
+|---|---|---|
+| GDN conv 输出按 `[0:2048\|2048:4096\|4096:6144]` 连续切 q/k/v | 成立 | `torch.split(mixed_qkv,[key_dim,key_dim,value_dim],-1)`；数值 max diff **0.0** |
+| conv tap 方向 `y[t,c]=silu(Σ_r w[c,r]·x[t+r-3,c])` | 成立 | 正向 0.28%（BF16 舍入），反向 96.94% |
+| `q_proj` view 成 `[T,8,512]` 后每 head 切 `[0:256]=Q`、`[256:512]=gate` | 成立 | 数值 max diff **0.0** |
+| gate 与 attention 输出都是 head-major，逐元素乘 sigmoid(gate) | 成立 | 重建 0.5%；不加 gate 3.29、gate 顺序打乱 1.50 作对照 |
+| 纯文本下 MRoPE 退化为普通 RoPE | 成立 | `cos[:32]==cos[32:]` 精确相等；与 `cos(pos·inv_freq)` 差 2e-3（BF16） |
+| `Qwen3_5RMSNorm` = `x·rsqrt(mean(x²)+eps)·(1+w)`，全 FP32 | 成立 | 源码逐行一致 |
+| rotary_dim=64，`inv_freq[j]=1/10⁷^(2j/64)`，配对 (j, j+32)，`[64:256]` 直通 | 成立 | `rotate_half` 在 64 维上切半，`cat((freqs,freqs))` 使 `cos[j]==cos[j+32]` |
+| `linear_num_value_heads / linear_num_key_heads = 16/16 = 1` | 成立 | `repeat_interleave` 是 no-op |
+| GDN 的 `1/sqrt(128)` scale 只作用于 q，在 delta rule 内部 | 成立 | `scale = 1/query.shape[-1]**0.5`，仅 `query = query * scale` |
+| l2norm 用 `sum` 不是 `mean`，eps=1e-6 | 成立 | `rsqrt((x*x).sum(-1)+1e-6)` |
+| `g = -exp(A_log_fp32)·softplus(a_fp32+dt_bias)`，全 FP32 | 成立 | 源码一致 |
+
+注意 HF 在 prefill（`seq_len>1` 且无 cache）走的是 `torch_chunk_gated_delta_rule`，即 chunk-64 路径，不是逐 token recurrent。
+
+### 6.3 参考实现比我们精度更低的四处
+
+这几处**不是 bug**，是参考实现在中途 round 到 BF16 而我们全程 FP32。逐层对拍时不能期待 bit-match，要按容差比；而且误差方向是"我们更准"：
+
+1. **`Qwen3_5RMSNormGated`**：FP32 归一化后 `hidden_states.to(input_dtype)` **先转 BF16，再乘 weight**。我们的 `gdn_gated_rmsnorm` 从头到尾 FP32。
+2. **GDN 的 l2norm**：在 `.to(torch.float32)` 之前调用，所以 q/k 的 L2 归一化是在 **BF16** 下做的。我们在 FP32。
+3. **`beta = b.sigmoid()`**：在 BF16 下算 sigmoid，之后才转 FP32。我们直接 FP32。
+4. **RoPE**：`cos/sin` 先 `.to(x.dtype)` 转成 BF16 再做旋转。我们在 kernel 内用 FP32 算 sin/cos。
+
+推论：单算子对拍容差按 BF16 量级设（相对误差 ~1%）；真正该盯死的是 **greedy token 序列完全一致**，以及逐层误差不随层数放大。近似平局时 argmax 可能被这些差异翻转，如果 token 序列在某一步分叉，先看那一步 top-2 的 logit 间距。
+
+## 7. 剩余工作
+
+原计划的前四项（GDN sequential delta rule、GDN gated RMSNorm、embedding gather、LM head + argmax）已全部完成，额外完成了计划外的 chunk-64 prefill 和 GDN decode，数值 oracle 也已就位（第 6 节）。
+
+**完整重算路径所需的 kernel 已经齐了**——embedding gather → RMSNorm → GEMM → GDN 全链 / full-attn 全链 → SwiGLU → residual → LM head+argmax，没有缺口。剩下的按建议顺序：
+
+1. **补 `gemm_2d` 的真实尺寸测试**。runner 每一层都在用它，但只测过 `(1,128,128)`。真实尺寸 K∈{1024,2048,3584}、N∈{16,512,1024,2048,3584,4096,6144}，都满足 `K%128==0`。独立、便宜，先做。
+2. **权重加载器**。Safetensors 解析，只加载 `model.language_model.*`，显式跳过 `model.visual.*` 和 `mtp.*`（张量名前缀已核对 `model.safetensors.index.json`，见 8.1）。断言：文本主干 `752,393,024` 参数、18 个 GDN 层、6 个 full-attention 层；`A_log[16]` 和 `linear_attn.norm.weight[128]` 必须按 FP32 读取；checkpoint 里**没有** `lm_head.weight`，必须复用 `embed_tokens.weight`。同时按第 4 节把 `q_proj.weight` 拆成 Q / gate 两个张量。
+3. **单层对拍**。先只跑第 0 层（GDN）和第 3 层（full attention），逐算子对 `oracle/layer00_gdn.pt` 和 `oracle/layer03_attn.pt`。布局 bug 会在这里全部暴露，比 24 层一起上好查得多。容差按 6.3 的说明设。
+4. **24 层完整 runner**。走完整重算路径，对 `oracle/hidden.pt` 的 26 个逐层输出，最后对 greedy token 序列。
+5. `depthwise_causal_conv4_decode`：维护 `[6144,4]` conv state，移位/环形更新后做 4-tap dot product。
+6. 带 KV cache 的 GQA decode kernel：只算新 query 对全部历史 K/V。
+7. 有了 5、6 之后接 GDN 的 `gdn_recurrent_decode`，把 runner 切成 prefill + 增量 decode 两条路径，并验证与完整重算等价。
+8. 性能收尾：`gemm_2d` 的 tuning、`prepare_wy` 的 DK/DV 分块、`chunk_state`/`chunk_output` 的 BLOCK_V autotune、`gdn_qk_norm_gates` 的 head 分块。
+
+MVP 阶段 GDN 建议先走 sequential 路径——它是自己写的、验证过，也是 chunked 的对拍基准；正确性打通后再切 chunk-64。
 
 host 侧还需要：position ids、停止条件（`<|im_end|>` = 248046 与 `<|endoftext|>` = 248044 由调用层配置）、以及 tokenizer 接入——`tokenize_text.py` 目前用 `tokenizers` 库跑通了单轮 chat template，够第一版用。
 
-## 7. 权重与运行环境
+## 8. 权重与运行环境
 
-### 7.1 Checkpoint 张量名
+### 8.1 Checkpoint 张量名
 
 本地 checkpoint 为单文件 `Qwen3.5-0.8B/model.safetensors-00001-of-00001.safetensors`，索引在 `model.safetensors.index.json`。三个顶层命名空间：
 
@@ -488,7 +559,7 @@ full-attention 层（i ∈ {3,7,11,15,19,23}）额外有：
 
 所有线性层都没有 bias；名字里唯一带 bias 的是 GDN 的 `dt_bias`，它是 softplus 的偏置，不是 GEMM bias。以上形状和 dtype 已直接从 safetensors header 核对。
 
-### 7.2 环境
+### 8.2 环境
 
 已确认环境：
 
@@ -496,6 +567,14 @@ full-attention 层（i ∈ {3,7,11,15,19,23}）额外有：
 GPU:    NVIDIA A100-SXM4-40GB
 Torch:  2.12.1+cu128
 Triton: 3.7.1
+```
+
+主环境**没有装 transformers**，引擎本体也不依赖它。参考实现隔离在项目内的 `.venv-oracle/`（`python -m venv --system-site-packages` 复用系统 torch，只额外装了 transformers 5.16.1），仅用于跑 `tools/dump_oracle.py` 生成 `oracle/` 下的参考张量。venv 和 oracle 产物都已 gitignore；重建方式：
+
+```bash
+python -m venv --system-site-packages .venv-oracle
+.venv-oracle/bin/pip install transformers
+.venv-oracle/bin/python tools/dump_oracle.py
 ```
 
 全部 kernel 自测命令（2026-09-01 全部通过）：
@@ -525,7 +604,7 @@ python -m py_compile triton_kernels/<file>.py
 python triton_kernels/<file>.py
 ```
 
-## 8. 协作偏好
+## 9. 协作偏好
 
 用户有 kernel 经验，希望沟通简洁：默认只说明输入、输出、运算逻辑和必要的布局/精度问题。
 
