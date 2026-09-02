@@ -16,7 +16,7 @@
 
 模型文件位于 `Qwen3.5-0.8B/`。完整模型结构和算子调研见 `README.md`；README 中第 3 节（视觉塔）、第 4 节（MTP）以及算子清单里标记为 `V` 的条目当前都不在范围内。
 
-关于 cache 的现状：GDN 两个 cache 的 decode kernel 都已就位——`gdn_recurrent_decode` 原地更新 `[16,128,128]` FP32 recurrent state（3.10b），`depthwise_causal_conv4_decode` 原地更新 `[4,6144]` BF16 conv state（3.8b），两者都验证过「prefill 前缀 + 逐 token decode」与整段 prefill 一致。**还差 full attention 的 KV cache**，缺了它 runner 就切不到增量 decode，所以当前仍按「每生成一个 token，对增长后的完整序列重新执行一次 forward」实现。
+关于 cache 的现状：GDN 两个 cache 的 decode kernel 都已就位——`gdn_recurrent_decode` 原地更新 `[16,128,128]` FP32 recurrent state（3.10b），`depthwise_causal_conv4_decode` 原地更新 `[4,6144]` BF16 conv state（3.8b），两者都验证过「prefill 前缀 + 逐 token decode」与整段 prefill 一致。full attention 的 KV cache decode kernel 也已完成（3.3b）。**三类 cache 至此齐备**，下一步是把 runner 拆成 prefill + decode 两条路径；在那之前当前仍按「每生成一个 token，对增长后的完整序列重新执行一次 forward」实现。
 
 无论走哪条路，Gated DeltaNet 在单次 forward 内必须按 token 顺序维护 recurrent state；完整重算时从零状态开始。
 
@@ -69,7 +69,7 @@ conv kernel      = 4（depthwise，6144 通道）
 
 ## 3. 已有 kernel
 
-共 14 个文件，全部位于 `triton_kernels/`，全部已有 autotune（少数固定配置）、`torch.library.triton_op` 封装、`register_fake` 和 PyTorch reference，且自测通过。注册的 op 命名空间统一为 `wy_lib::`。
+共 15 个文件，全部位于 `triton_kernels/`，全部已有 autotune（少数固定配置）、`torch.library.triton_op` 封装、`register_fake` 和 PyTorch reference，且自测通过。注册的 op 命名空间统一为 `wy_lib::`。
 
 ### 3.1 `gemm_2d.py` — `wy_lib::gemm_2d`
 
@@ -276,6 +276,51 @@ kernel body 对布局是无感的——指针算术全靠 stride 参数驱动，
 访存量只有 `读 9D + 写 5D` ≈ 172 KiB。注意 eager 下单次调用要 89.4μs（几乎全是
 `torch.library` 分发，见 8.2），而 kernel 本身只有 1.6μs——**这个 kernel 的任何
 进一步优化都量不出来**，除非先把调用开销解决掉。
+
+### 3.3b `gqa_attention_decode.py` — `wy_lib::gqa_attention_decode`
+
+3.3 的 decode 版，带整块 KV cache。三类 cache 至此齐备。
+
+```text
+q:       [H_q, D]        BF16   新 token 的 query，已过 q_norm 和 RoPE
+k_new:   [H_kv, D]       BF16   新 token 的 key，已过 k_norm 和 RoPE
+v_new:   [H_kv, D]       BF16
+k_cache: [H_kv,T_max,D]  BF16   原地追加
+v_cache: [H_kv,T_max,D]  BF16   原地追加
+past_len: int                   追加位置
+out:     [H_q, D]        BF16
+```
+
+与 prefill 版的三个差别：**不需要 causal mask**（cache 里每个位置都该被 attend，
+唯一的 mask 是 `offset_t < seq_len` 的越界保护）；query 只有一行，没有 Q 方向分块；
+K/V 来自 cache。
+
+**cache 里存的必须是 RoPE 之后的 K**——参考实现是先 `apply_rotary_pos_emb`
+再 `past_key_values.update`，历史 token 的 position 不会变。
+
+布局选 `[H_kv, T_max, D]`：读时 D 维连续、每行 512B 用满，写时每个 head 一次连续写。
+另两种布局的写入都是跨步的。KV cache 8K 上下文 96 MiB 远超 40MB L2，这里的合并访问
+是实打实的 DRAM 带宽。显存 12 KiB/token，8K 上下文 96 MiB。
+
+**不做 paging**：paging 解决的四个问题（多序列碎片、continuous batching、前缀共享、
+beam search 分叉）当前一个都不存在。将来要加也便宜——T 方向本来就分块遍历，
+插 paging 只是循环里多一次块表查询，工作量在 host 侧分配器，与 kernel 解耦。
+
+追加放在 python wrapper 里而不是 kernel 里：kernel 内写完紧接着要读回同一位置，
+跨 program 的写后读没有可见性保证。代价是每层多两次 PyTorch copy 的 launch。
+
+**grid 是 `(H_kv,)` = 2，不是 `(H_q,)`。** 与 prefill 版同一个选择（KV 只读一遍）。
+kernel 里 `offset_h = pid * GROUP + tl.arange(0, GROUP)`，用 `num_q_heads` 起 grid
+会让 pid≥2 的 program 越界读 cache、越界写 `out`（写到第 31 行而 out 只有 8 行），
+踩坏分配器里相邻的张量，表现为"数据相关的错值"，最后变成 illegal memory access。
+这个 bug 实际发生过，见下面的调试记录。
+
+测试：`T=1,17,65,129,257` 的 prefill+decode 等价性（T 特意取非 `BLOCK_T` 整数倍，
+用来抓尾块没置 `-inf` 的 bug），最大绝对误差 ≤ `0.015625`；外加一条越界保护检查——
+把 cache 中 `past_len` 之后填 NaN，结果必须完全不变。
+
+**下一步必须做 split-K，不是可选优化。** 实测 2 个 CTA 即使开 16 warp 也只有饱和带宽
+的 4%（46 GB/s vs 1170 GB/s），天花板由"只占 2 个 SM"决定。详见 8.6。
 
 ### 3.9 `gdn_qk_norm_gates.py` — `wy_lib::gdn_qk_norm_gates`
 
@@ -822,7 +867,63 @@ CPU 停顿。同样地，8.4 表里 T=128 那行的 "forward 总 GPU 20.49ms" �
 **要测 kernel 的真实 GPU 效率，必须先用 CUDA Graph 或 torch.compile 把 CPU 摘掉。**
 本仓库任何"kernel 慢"的结论，如果不是这样测的，先怀疑测量方法。
 
-### 8.6 一个测量陷阱
+### 8.6 decode 阶段的 CTA 并行度：为什么 split-K 是必须的
+
+按 KV head 分块时 grid 只有 `(H_kv,)` = 2。实测流式读 96 MiB 的达成带宽：
+
+```text
+CTA 数     2 warp     4 warp     8 warp    16 warp
+    2       4GB/s      8GB/s     21GB/s     46GB/s
+    8      16GB/s     32GB/s     81GB/s    181GB/s
+   32      62GB/s    122GB/s    308GB/s    628GB/s
+  108     206GB/s    393GB/s    877GB/s   1186GB/s
+  432     675GB/s    998GB/s   1171GB/s   1195GB/s   ← 饱和约 1170 GB/s
+```
+
+**2 个 CTA 即使开 16 warp 也只有饱和带宽的 4%**。加 warp 有用（4→46 GB/s，11 倍）
+但补不回来——CTA 被限制在单个 SM 上，天花板就是 2/108。带宽大致正比于在飞的 warp
+总数（约 1.4 GB/s per warp），要打满需要 ~100 个 CTA（8 warp）或 ~50 个（16 warp）。
+
+折算到 6 层合计的每步 KV 读取耗时，对照每步必须读一遍 1.4 GiB 权重的 1.23 ms 地板：
+
+```text
+T       不切 T（2 CTA/8 warp）    split-K      占 decode 步
+512            300 us              39 us        24% vs 3%
+2048           1.2 ms              42 us        98% vs 3%
+8192           4.8 ms              92 us       390% vs 7%
+```
+
+所以 split-K 不是"长上下文才需要的优化"，T=512 就已经吃掉四分之一。
+`num_splits` 取 50~200（即 100~400 个 CTA）进饱和区。
+
+顺带：prefill 版的 autotune `num_warps` 只到 `[2,4]`，那是因为它 CTA 数本来就多；
+decode 是纯 memory-bound 且 CTA 极少，warp 数影响很大，应该覆盖到 8/16。
+
+### 8.7 一次真实的 IMA 排查：grid 与 kernel 分块假设不一致
+
+`gqa_attention_decode` 开发时踩到的，过程值得记下来。
+
+**症状**：走完整 op 路径时，某些 `seq_len` 结果错（`err=1.48`）、某些出 NaN，
+但 `K.fn` 直调所有配置全对；错误看起来"数据相关"且一度被误判为非确定性。
+
+**根因**：wrapper 用 `grid=(num_q_heads,)=8` 启动，但 kernel 把 `pid` 当 KV head 用
+（`offset_h = pid * GROUP + tl.arange(0, GROUP)`）。pid=2..7 的 program 越界读 cache、
+**越界写 `out`**（写到第 31 行，out 只有 8 行），踩坏分配器里相邻的张量。
+
+**排查中的两个教训**：
+
+1. **"非确定性"是我自己的比较脚本造出来的**。判据写成 `if max(diffs) > 0`，
+   而 `NaN > 0` 是 False，于是含 NaN 的结果被打印成"完全一致"。真实行为一直是
+   确定的——同样输入三轮跑，错的位置完全相同。判断随机性时要先确认比较逻辑
+   对 NaN 的处理。
+2. **失败率不是 100% 时，单样本扫描没有意义**。第一轮"每个配置单跑一次都通过"
+   完全是运气，后来每配置跑 20 次才看清。
+
+**下次遇到类似症状的定位顺序**：先看是不是 IMA（`CUDA_LAUNCH_BLOCKING=1` 能把
+异步报错拉到出错点），IMA 优先怀疑 grid/索引越界而不是数学；再对比"走完整 op 路径"
+与"直调 `K.fn`"——两者结果不同就说明问题在 wrapper 而不在 kernel body。
+
+### 8.8 一个测量陷阱
 
 不要在同一个进程里先跑 compiled 再跑 eager 做对照。dynamo 的 frame hook 会拦截
 同一个函数对象反复做 guard 检查和重编译尝试，eager 会被测成 6142 ms/token
@@ -859,9 +960,8 @@ CPU 停顿。同样地，8.4 表里 T=128 那行的 "forward 总 GPU 20.49ms" �
    那 6 层 attention 也拿不到"只有一个新 token"的输入：
 
    - ~~`depthwise_causal_conv4_decode`~~ **已完成**，见 3.8b；
-   - 带 KV cache 的 GQA decode kernel：只算新 query 对全部历史 K/V。**注意它本身不是
-     提速手段**——full attention 只占 GPU 时间 2-3% 且不随 T 增长（8.4），做它纯粹
-     因为它是 decode 模式的必需件；
+   - ~~带 KV cache 的 GQA decode kernel~~ **已完成**，见 3.3b。但它目前 grid 只有
+     2 个 CTA，只有饱和带宽的 4%，**必须先补 split-K**（见 8.6）才能真正用；
    - GDN 侧直接接已有的 `gdn_recurrent_decode`（state cache 路径已验证）。
 
    齐了之后把 runner 拆成 prefill + decode 两条路径，用当前的完整重算版本做等价性
@@ -954,6 +1054,7 @@ python -m venv --system-site-packages .venv-oracle
 python triton_kernels/gemm_2d.py
 python triton_kernels/qwen_rmsnorm.py
 python triton_kernels/gqa_attention_without_kvcache_casual.py
+python triton_kernels/gqa_attention_decode.py
 python triton_kernels/partial_rope.py
 python triton_kernels/attention_gate_pack.py
 python triton_kernels/residual_add.py

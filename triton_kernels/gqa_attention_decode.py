@@ -3,57 +3,12 @@
 这是 3.3 `gqa_attention_without_kvcache_casual` 的 decode 版，也是切换到增量
 decode 所缺的最后一块（GDN 的两个 cache kernel 已就位，见 3.8b / 3.10b）。
 
-模型参数：Q head 8 个，KV head 2 个，GROUP = 4，head_dim = 256。
-
 与 prefill 版的三个关键差别
 --------------------------
-1. **不需要 causal mask**。cache 里每个位置都在新 token 之前（或就是它自己），
-   全部都该被 attend。唯一的 mask 是 `offset_t < seq_len` 的越界保护。
-2. **query 只有一行**，所以没有 Q 方向的分块，只在 T 方向做 online softmax。
-3. **K/V 来自 cache 而不是参数**，新 token 的 K/V 要先追加进 cache。
-
-按 KV head 分块，grid = (H_kv,) = 2
------------------------------------
-与 prefill 版同一个选择：一个 program 负责一个 KV head 及其 GROUP 个 Q head，
-KV 只读一遍。按 Q head 分块的话 grid=(8,)，但每个 KV head 会被读 4 遍。
-
-代价是 CTA 只有 2 个。实测（A100，流式读 96 MiB）：
-
-    CTA 数     2 warp     4 warp     8 warp    16 warp
-        2       4GB/s      8GB/s     21GB/s     46GB/s
-        8      16GB/s     32GB/s     81GB/s    181GB/s
-       32      62GB/s    122GB/s    308GB/s    628GB/s
-      108     206GB/s    393GB/s    877GB/s   1186GB/s
-      432     675GB/s    998GB/s   1171GB/s   1195GB/s   ← 饱和约 1170 GB/s
-
-**2 个 CTA 即使开 16 warp 也只有 46 GB/s，是饱和带宽的 4%**——天花板由"只占
-2 个 SM"决定，加 warp 补不回来。带宽大致正比于在飞的 warp 总数（约 1.4 GB/s
-per warp），要打满需要 ~100 个 CTA（8 warp）或 ~50 个（16 warp）。
-
-所以 autotune 的 num_warps 一定要覆盖到 8/16——prefill 版只用到 [2,4]，那是因为
-它 CTA 数本来就多；decode 这边 warp 数的影响非常大。
-
-**下一步必须做 split-K**（不是可选优化）。把 T 切成 num_splits 段，
-grid 变成 `(H_kv, num_splits)`，每段算局部 (m_i, l_i, acc)，再用第二个 kernel 归约：
-
-    m   = max_i m_i
-    l   = sum_i l_i * exp2(m_i - m)
-    acc = sum_i acc_i * exp2(m_i - m)
-    out = acc / l
-
-num_splits 取到 50~200（即 100~400 个 CTA）就能进饱和区。按 6 层合计估算：
-
-    T       不切 T（2 CTA/8 warp）    split-K      倍数
-    512            300 us              39 us       7.7x
-    2048           1.2 ms              42 us        29x
-    8192           4.8 ms              92 us        52x
-
-对照：每个 decode step 必须读一遍全部 1.4 GiB 权重 ≈ 1.23 ms。不切 T 的话
-T=2048 时 attention 就和整个模型的权重读取一样贵了。
-
-本文件先实现不切 T 的版本，它是 split-K 的对拍基准——跨 split 的 m/l 重缩放是
-bug 高发区，错了往往只偏一点点，没有基准很难发现（GDN 那边 chunk 版比 sequential
-慢 20 倍，正是靠 sequential 当基准才能确认"慢但对"）。
+1. **不需要 causal mask**。cache 里的每一个位置都在新 token 之前（或就是它自己），
+   全部都该被 attend。prefill 那种下三角 mask 在这里是多余的。
+2. **query 只有一行**，`[H_q, D]`。所以没有 Q 方向的分块，只在 T 方向做 online softmax。
+3. **K/V 来自 cache 而不是参数**，且新 token 的 K/V 要先追加进 cache。
 
 cache 布局：`[H_kv, T_max, D]`，整块预分配
 -----------------------------------------
@@ -63,7 +18,7 @@ kernel 里 T 方向本来就是分块遍历，插 paging 只是在循环里多�
 
 选 `[H_kv, T_max, D]` 而不是 `[H_kv, D, T_max]` 或 `[T_max, H_kv, D]`：
 
-    读：一次取 k_cache[h, t0:t0+TILE_KV, :]，D 维连续，每行 512B 全部用满
+    读：一次取 k_cache[h, t0:t0+BLOCK_T, :]，D 维连续，每行 512B 全部用满
     写：新 token 每个 head 写 256 个连续值，一次连续写
 
 另外两种布局的写入都是跨步的。KV cache 在 8K 上下文是 96 MiB，**远超 A100 的 40MB
@@ -87,21 +42,72 @@ L2**，所以这里的合并访问是实打实的 DRAM 带宽，不像 conv stat
     past_len: int                   追加位置 = 追加前的历史长度
     out:     [H_q, D]        BF16
 
-运算
-----
+运算（GROUP = H_q // H_kv = 4）
+------------------------------
     追加：k_cache[h_kv, past_len, :] = k_new[h_kv, :]，v 同理
     S = past_len + 1
-    对每个 KV head h_kv，它负责的 Q head 是 [h_kv*GROUP, (h_kv+1)*GROUP)：
-        score[g,t] = dot(q[h_kv*GROUP+g, :], k_cache[h_kv,t,:]) * D^-0.5
-        p          = softmax_fp32(score, over t)
-        out[...]   = sum_t p[g,t] * v_cache[h_kv,t,:]
+    对每个 query head h_q，取 h_kv = h_q // GROUP：
+        score[t] = dot(q[h_q,:], k_cache[h_kv,t,:]) * D^-0.5      t = 0..S-1
+        p        = softmax_fp32(score)
+        out[h_q] = sum_t p[t] * v_cache[h_kv,t,:]
 
 追加放在 python wrapper 里而不是 kernel 里
 ------------------------------------------
-kernel 内追加的话，写完紧接着要读回同一位置——跨 program 的写后读没有可见性保证。
-放在 wrapper 里用一次 slice 赋值最简单也最容易验证。代价是每层多两次 PyTorch copy
-的 launch。想融进 kernel 的正确做法是：循环只读 `[0, past_len)`，新 token 的 k/v
-直接从寄存器参与 online softmax 的最后一步，完全不经过 cache 读回。这是后续融合点。
+如果在 kernel 里追加，同一个 h_kv 会被 GROUP 个 program 同时写同一个位置（写的值相同，
+数据上无害），但紧接着又要读回这个位置——跨 program 的写后读没有可见性保证，需要
+fence。放在 wrapper 里用一次 slice 赋值最简单也最容易验证。
+
+代价是每层多两次 PyTorch copy 的 launch。想融进 kernel 的话正确做法是：循环只读
+`[0, past_len)`，新 token 的 k/v 直接从寄存器参与 online softmax 的最后一步，
+完全不经过 cache 读回。这是后续的融合点，不是第一版该做的事。
+
+按 KV head 分块，grid = `(H_kv,)` = 2
+-------------------------------------
+与 prefill 版同一个选择：一个 program 负责一个 KV head 及其 GROUP 个 Q head，
+KV 只读一遍。按 Q head 分块的话 grid=(8,)，每个 KV head 会被读 4 遍。
+
+**grid 必须是 `num_kv_heads` 而不是 `num_q_heads`。** kernel 里
+`offset_h = pid * GROUP + tl.arange(0, GROUP)`，用 8 起 grid 的话 pid=2..7 会
+越界读 cache、并越界写 `out`（写到第 31 行，而 out 只有 8 行），踩坏分配器里
+相邻的张量——表现为"数据相关的错值"，最后变成 illegal memory access。
+
+下一步必须做 split-K（不是可选优化）
+-------------------------------------
+代价是 CTA 只有 2 个。实测（A100，流式读 96 MiB）：
+
+    CTA 数     2 warp     4 warp     8 warp    16 warp
+        2       4GB/s      8GB/s     21GB/s     46GB/s
+       32      62GB/s    122GB/s    308GB/s    628GB/s
+      108     206GB/s    393GB/s    877GB/s   1186GB/s
+      432     675GB/s    998GB/s   1171GB/s   1195GB/s   ← 饱和约 1170 GB/s
+
+**2 个 CTA 即使开 16 warp 也只有饱和带宽的 4%**——天花板由"只占 2 个 SM"决定，
+加 warp 补不回来。带宽大致正比于在飞的 warp 总数（约 1.4 GB/s per warp），
+要打满需要 ~100 个 CTA（8 warp）或 ~50 个（16 warp）。
+
+split-K：把 T 切成 num_splits 段，grid 变成 `(H_kv, num_splits)`，每段算局部
+(m_i, l_i, acc)，再用第二个 kernel 归约：
+
+    m   = max_i m_i
+    l   = sum_i l_i * exp(m_i - m)
+    acc = sum_i acc_i * exp(m_i - m)
+    out = acc / l
+
+num_splits 取 50~200（即 100~400 个 CTA）就能进饱和区。按 6 层合计估算：
+
+    T       不切 T（2 CTA/8 warp）    split-K      倍数
+    512            300 us              39 us       7.7x
+    2048           1.2 ms              42 us        29x
+    8192           4.8 ms              92 us        52x
+
+对照：每个 decode step 必须读一遍全部 1.4 GiB 权重 ≈ 1.23 ms。不切 T 的话
+T=2048 时 attention 就和整个模型的权重读取一样贵了。
+
+本文件这个不切 T 的版本是 split-K 的对拍基准——跨 split 的 m/l 重缩放是 bug
+高发区，错了往往只偏一点点，没有基准很难发现。
+
+另：autotune 的 num_warps 目前只到 8。decode 是纯 memory-bound 且 CTA 数很少，
+warp 数影响很大（上表 2 CTA 那行 4 warp 8GB/s vs 16 warp 46GB/s），建议加到 16。
 """
 
 import torch
@@ -110,18 +116,12 @@ import triton
 import triton.language as tl
 
 
-# 写完 _gqa_attention_decode_triton 的 body 之后改成 True，__main__ 的第 2 段测试
-# 就会跑起来。判断放在 python wrapper 里而不是 kernel 里：`raise` 不是合法的
-# Triton AST 节点。
-KERNEL_IMPLEMENTED = False
-
-
-# decode 是纯 memory-bound 且 CTA 数很少（grid=(H_kv,)=2），num_warps 的影响远大于
-# prefill 版，所以这里一直覆盖到 16。
 autotune_configs = [
-    triton.Config({"TILE_KV": tile_kv}, num_warps=num_warps, num_stages=2)
-    for tile_kv in [32, 64, 128]
-    for num_warps in [4, 8, 16]
+    triton.Config({"BLOCK_T": 16}, num_warps=4, num_stages=1),
+    triton.Config({"BLOCK_T": 32}, num_warps=4, num_stages=1),
+    triton.Config({"BLOCK_T": 64}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_T": 64}, num_warps=8, num_stages=2),
+    triton.Config({"BLOCK_T": 128}, num_warps=8, num_stages=2),
 ]
 
 
@@ -140,7 +140,7 @@ def _seq_bucket(seq_len: int) -> int:
 
 @triton.autotune(
     configs=autotune_configs,
-    key=["d_model", "group_size", "S_BUCKET"],
+    key=["H_Q", "D", "GROUP", "S_BUCKET"],
 )
 @triton.jit
 def _gqa_attention_decode_triton(
@@ -159,86 +159,61 @@ def _gqa_attention_decode_triton(
     stride_o_h: tl.constexpr,
     stride_o_d: tl.constexpr,
     seq_len,  # = past_len + 1，运行时值
-    sm_scale: tl.constexpr,  # = d_model ** -0.5
-    d_model: tl.constexpr,
-    group_size: tl.constexpr,  # H_q // H_kv = 4
+    scale,  # = D ** -0.5，FP32
+    H_Q: tl.constexpr,
+    D: tl.constexpr,
+    GROUP: tl.constexpr,  # H_q // H_kv
     S_BUCKET: tl.constexpr,
-    TILE_KV: tl.constexpr,
+    BLOCK_T: tl.constexpr,
 ):
-    # TODO(kernel): 留给你写。结构与 prefill 版同源，去掉 Q 方向分块和 causal mask。
-    #
-    # 一个 program 负责一个 KV head 及其 group_size 个 Q head：
-    #
-    #   head_id = tl.program_id(0)                       # 0..H_kv-1
-    #   offset_d  = tl.arange(0, d_model)
-    #   offset_qh = head_id * group_size + tl.arange(0, group_size)
-    #
-    #   # [group_size, d_model]，decode 只有一行 query，没有 BLOCK_Q_S 这一维
-    #   q = tl.load(q_ptr + offset_qh[:, None] * stride_q_h
-    #               + offset_d[None, :] * stride_q_d)
-    #
-    #   # 和 prefill 版一样把 log2(e) 折进 scale，循环里用 exp2 而不是 exp
-    #   qk_scale = sm_scale * 1.4426950408889634
-    #   q = (q * qk_scale).to(tl.bfloat16)
-    #
-    #   # K 摆成 [d_model, seq_len]，tl.dot 可以直接用，不必转置
-    #   k_block_ptr = tl.make_block_ptr(
-    #       base=k_cache_ptr + head_id * stride_kc_h,
-    #       shape=(d_model, seq_len), strides=(stride_kc_d, stride_kc_t),
-    #       offsets=(0, 0), block_shape=(d_model, TILE_KV), order=(0, 1))
-    #   v_block_ptr = tl.make_block_ptr(
-    #       base=v_cache_ptr + head_id * stride_vc_h,
-    #       shape=(seq_len, d_model), strides=(stride_vc_t, stride_vc_d),
-    #       offsets=(0, 0), block_shape=(TILE_KV, d_model), order=(1, 0))
-    #
-    #   m_i = tl.zeros([group_size], tl.float32) - float('inf')
-    #   l_i = tl.zeros([group_size], tl.float32)
-    #   acc = tl.zeros([group_size, d_model], tl.float32)
-    #
-    #   for start_kv in tl.range(0, seq_len, TILE_KV):
-    #       k = tl.load(k_block_ptr, boundary_check=(1,)).to(tl.bfloat16)
-    #       v = tl.load(v_block_ptr, boundary_check=(0,)).to(tl.bfloat16)
-    #
-    #       qk = tl.dot(q, k)                             # [group_size, TILE_KV]
-    #
-    #       # ！！尾块必须显式置 -inf ！！见下面的说明
-    #       offset_kv = start_kv + tl.arange(0, TILE_KV)
-    #       qk = tl.where(offset_kv[None, :] < seq_len, qk, float('-inf'))
-    #
-    #       m_i_new = tl.maximum(m_i, tl.max(qk, axis=-1))
-    #       alpha = tl.math.exp2(m_i - m_i_new)
-    #       p = tl.math.exp2(qk - m_i_new[:, None])
-    #
-    #       acc = acc * alpha[:, None] + tl.dot(p.to(tl.bfloat16), v)
-    #       l_i = l_i * alpha + tl.sum(p, axis=-1)
-    #       m_i = m_i_new
-    #
-    #       k_block_ptr = tl.advance(k_block_ptr, (0, TILE_KV))
-    #       v_block_ptr = tl.advance(v_block_ptr, (TILE_KV, 0))
-    #
-    #   acc = acc / l_i[:, None]
-    #   tl.store(out_ptr + offset_qh[:, None] * stride_o_h
-    #            + offset_d[None, :] * stride_o_d, acc.to(tl.bfloat16))
-    #
-    # 几个要点：
-    #
-    # - **尾块的 -inf 是最容易漏的一处**。prefill 版靠 causal mask 顺带把尾块盖住了，
-    #   decode 没有 causal mask，就只剩这一处 mask。`boundary_check` 把越界位置填 0
-    #   而不是 -inf，所以 qk 在那里是 0，`exp2(0 - m)` 会实实在在地加进 l_i，
-    #   结果整体被缩小。凡是 seq_len 不是 TILE_KV 整数倍就会触发——
-    #   测试里的 T=17/65/129/257 都能抓到。
-    #
-    # - **不要 causal mask**。cache 里所有位置都该被 attend，加了反而错。
-    #
-    # - 第一个 tile 时 m_i = -inf，`exp2(-inf - m_i_new)` 给 0 是对的；只有当整个
-    #   seq_len 内全是 -inf 才会出 NaN，而至少有一个有效位置，不会发生。
-    #
-    # - GQA 不要 materialize repeat_kv，用 head_id 直接索引 KV cache 即可。
-    #
-    # - tl.dot 的 M 维在这里是 group_size=4。Triton 3.7 实测 M=4 可用（已验证），
-    #   不需要 pad 到 16。
-    tl.static_assert(d_model % 16 == 0)
-    tl.static_assert(group_size >= 1)
+    # 按照kv的head切分block 减少对kv的读取
+    # 副作用是会造成decode阶段cta数量不足 这个矛盾在后续的迭代kernel里面使用split-k进行弥补
+    pid_h = tl.program_id(0)
+
+    # kv cache偏移消除head维度
+    k_cache_ptr = k_cache_ptr + pid_h * stride_kc_h
+    v_cache_ptr = v_cache_ptr + pid_h * stride_vc_h
+
+    offset_h = pid_h * GROUP + tl.arange(0, GROUP)
+    offset_d = tl.arange(0, D)
+    q = tl.load(q_ptr + offset_h[:, None] * stride_q_h + offset_d[None, :] * stride_q_d) # q不需要mask [GROUP, D]
+
+    acc = tl.zeros([GROUP, D], dtype = tl.float32) # V 的加权和 必须从 0 起
+    m_i = tl.zeros([GROUP], dtype = tl.float32) - float('inf') # 局部最大值
+    l_i = tl.zeros([GROUP], dtype = tl.float32) # 分母累加和
+
+    for t0 in tl.range(0, seq_len, BLOCK_T):
+        offset_t = t0 + tl.arange(0, BLOCK_T)
+        k = tl.load(
+            k_cache_ptr + offset_t[None, :] * stride_kc_t + offset_d[:, None] * stride_kc_d, 
+            mask = offset_t[None, :] < seq_len,
+            other = 0.0
+        ) # [D, BLOCK_T] 载入过程中完成转置
+        qk = tl.dot(q, k) * scale # [GROUP, BLOCK_T]
+        qk = tl.where(offset_t[None, :] < seq_len, qk, -float('inf')) # mask越界位置
+
+        m_i_new = tl.maximum(m_i, tl.max(qk, axis=1))
+        alpha = tl.exp(m_i - m_i_new)
+        p = tl.exp(qk - m_i_new[:, None]) # 这边不需要再次对p执行tl.where 因为对-inf取exp本身等于0 m_i_new不存在整行被mask的情况
+
+        v = tl.load(
+            v_cache_ptr + offset_t[:, None] * stride_vc_t + offset_d[None, :] * stride_vc_d,
+            mask = offset_t[:, None] < seq_len,
+            other = 0.0
+        )
+
+        # p 是 FP32、v 是 BF16，tl.dot 要求两个操作数同 dtype，这里显式降到 BF16
+        acc = acc * alpha[:, None] + tl.dot(p.to(tl.bfloat16), v) # [GROUP, D]
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+
+        m_i = m_i_new 
+
+    out = acc / l_i[:, None]
+
+    # 写回
+    # element_ty 只有指针类型才有，要取 out_ptr 的而不是 out 这个值的
+    tl.store(out_ptr + offset_h[:, None] * stride_o_h + offset_d[None, :] * stride_o_d, out.to(out_ptr.dtype.element_ty))
+
 
 
 @torch.library.triton_op(
@@ -253,11 +228,6 @@ def gqa_attention_decode(
     v_cache: torch.Tensor,
     past_len: int,
 ) -> torch.Tensor:
-    if not KERNEL_IMPLEMENTED:
-        raise NotImplementedError(
-            "_gqa_attention_decode_triton 的 body 还没写；"
-            "写完后把本文件顶部的 KERNEL_IMPLEMENTED 改成 True"
-        )
     assert q.ndim == 2 and k_new.ndim == 2 and v_new.ndim == 2
     assert k_cache.ndim == 3 and v_cache.ndim == 3
     assert q.dtype == torch.bfloat16 and k_cache.dtype == torch.bfloat16
@@ -274,14 +244,17 @@ def gqa_attention_decode(
     assert 0 <= past_len < max_len, f"past_len={past_len} 超出 cache 容量 {max_len}"
     assert triton.next_power_of_2(head_dim) == head_dim
 
-    # 追加放在这里而不是 kernel 里：kernel 内写完紧接着要读回同一位置，
-    # 跨 program 的写后读没有可见性保证。详见模块 docstring。
+    # 追加放在这里而不是 kernel 里：kernel 里同一个 KV head 会被 GROUP 个 program
+    # 同时写、随即又读回，跨 program 的写后读没有可见性保证。详见模块 docstring。
     k_cache[:, past_len, :] = k_new
     v_cache[:, past_len, :] = v_new
     seq_len = past_len + 1
 
     out = torch.empty_like(q)
 
+    # 按 KV head 分块：一个 program 负责一个 KV head 及其 GROUP 个 Q head。
+    # 这里必须是 num_kv_heads——kernel 里 offset_h = pid * GROUP + arange(GROUP)，
+    # 用 num_q_heads 起 grid 会让 pid>=num_kv_heads 的 program 越界读 cache、越界写 out。
     torch.library.wrap_triton(_gqa_attention_decode_triton)[(num_kv_heads,)](
         q_ptr=q,
         stride_q_h=q.stride(0),
@@ -298,9 +271,10 @@ def gqa_attention_decode(
         stride_o_h=out.stride(0),
         stride_o_d=out.stride(1),
         seq_len=seq_len,
-        sm_scale=head_dim**-0.5,
-        d_model=head_dim,
-        group_size=num_q_heads // num_kv_heads,
+        scale=head_dim**-0.5,
+        H_Q=num_q_heads,
+        D=head_dim,
+        GROUP=num_q_heads // num_kv_heads,
         S_BUCKET=_seq_bucket(seq_len),
     )
     return out
@@ -453,36 +427,31 @@ if __name__ == "__main__":
 
     # ---- 第 2 步：Triton kernel vs 参考实现 -------------------------------
     print("=== Triton kernel vs 参考实现 ===")
-    try:
-        # T 特意取成非 TILE_KV 整数倍，用来抓尾块没置 -inf 的 bug
-        for token_num, prefix in ((1, 0), (17, 5), (65, 33), (129, 64), (257, 128)):
-            actual, expected = run_prefill_then_decode(
-                token_num, prefix, call_gqa_attention_decode_triton
-            )
-            err = (actual.float() - expected.float()).abs().max().item()
-            torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
-            assert torch.isfinite(actual).all()
-            print(
-                f"  T={token_num:>4} prefix={prefix:>3}  max_abs_error={err:.8f}  "
-                f"best_config={_gqa_attention_decode_triton.best_config}"
-            )
+    for token_num, prefix in ((1, 0), (17, 5), (65, 33), (129, 64), (257, 128)):
+        actual, expected = run_prefill_then_decode(
+            token_num, prefix, call_gqa_attention_decode_triton
+        )
+        err = (actual.float() - expected.float()).abs().max().item()
+        torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+        assert torch.isfinite(actual).all()
+        print(
+            f"  T={token_num:>4} prefix={prefix:>3}  max_abs_error={err:.8f}  "
+            f"best_config={_gqa_attention_decode_triton.best_config}"
+        )
 
-        # cache 里 past_len 之后的位置不该被读到：填成 NaN 也必须不影响结果
-        q = torch.randn((H_Q, D), dtype=torch.bfloat16, device="cuda")
-        k_new = torch.randn((H_KV, D), dtype=torch.bfloat16, device="cuda")
-        v_new = torch.randn_like(k_new)
-        k_cache, v_cache = allocate_kv_cache(H_KV, MAX_LEN, D)
-        k_cache[:, :10].normal_()
-        v_cache[:, :10].normal_()
-        clean = call_gqa_attention_decode_triton(q, k_new, v_new, k_cache, v_cache, 10)
-        k_cache[:, 11:] = float("nan")
-        v_cache[:, 11:] = float("nan")
-        dirty = call_gqa_attention_decode_triton(q, k_new, v_new, k_cache, v_cache, 10)
-        torch.testing.assert_close(clean, dirty)
-        assert torch.isfinite(dirty).all()
-        print("  cache 尾部填 NaN 不影响结果（越界保护正确）")
+    # cache 里 past_len 之后的位置不该被读到：填成 NaN 也必须不影响结果
+    q = torch.randn((H_Q, D), dtype=torch.bfloat16, device="cuda")
+    k_new = torch.randn((H_KV, D), dtype=torch.bfloat16, device="cuda")
+    v_new = torch.randn_like(k_new)
+    k_cache, v_cache = allocate_kv_cache(H_KV, MAX_LEN, D)
+    k_cache[:, :10].normal_()
+    v_cache[:, :10].normal_()
+    clean = call_gqa_attention_decode_triton(q, k_new, v_new, k_cache, v_cache, 10)
+    k_cache[:, 11:] = float("nan")
+    v_cache[:, 11:] = float("nan")
+    dirty = call_gqa_attention_decode_triton(q, k_new, v_new, k_cache, v_cache, 10)
+    torch.testing.assert_close(clean, dirty)
+    assert torch.isfinite(dirty).all()
+    print("  cache 尾部填 NaN 不影响结果（越界保护正确）")
 
-        print("All GQA attention decode tests passed.")
-    except NotImplementedError as exc:
-        print(f"  跳过：{exc}")
-        print("  填完 _gqa_attention_decode_triton 的 body 后重跑本文件。")
+    print("All GQA attention decode tests passed.")
