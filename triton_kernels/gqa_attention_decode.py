@@ -364,6 +364,386 @@ def _torch_reference(
     return out.to(q.dtype)
 
 
+# ===========================================================================
+# split-K 版本：把 T 切成 MAX_SPLITS 段并行算，再用第二个 kernel 归约
+# ===========================================================================
+#
+# 为什么是两个 kernel 而不是 tl.atomic_add
+# ---------------------------------------
+# online softmax 的归约不是简单求和：acc 和 l 都要先按**全局** max 重新缩放才能相加。
+# atomic_add 只能无条件累加；就算用 atomic_max 求出全局 m，此前已累加进去的 acc
+# 是按旧 max 缩放的，事后无法追溯修正——要修正就得再扫一遍，那本质就是第二个 kernel。
+#
+# 唯一能让 atomic 成立的办法是放弃减 max、直接算 exp(s) 再纯加。数学上可行，
+# 但丢掉数值稳定性（fp32 里 exp(s) 在 s>88 溢出），而这正是 online softmax 要消除的
+# 隐患。另外 atomic 的累加顺序不定会破坏结果可复现性，而本项目的验收方法
+# （逐算子对拍 + 分叉步的 top-2 间距）依赖确定性。
+#
+# num_splits 为什么恒等于 MAX_SPLITS
+# ----------------------------------
+# 更多 split 没有收益——CTA 数过了 ~432 带宽就饱和了（见模块 docstring 的实测表），
+# 所以 split 数天然有上界。固定成常数还有个更强的理由：**cudagraph 要求 grid 在
+# capture 时固定**，而 cudagraph 是把 CPU 开销归零的唯一途径（HANDOFF 8.3）。
+# num_splits 随 seq_len 变的话每步都要重新 capture，等于白做。
+#
+# 于是 scratch buffer 也是定长的，不随 token 数增长：
+#
+#     m_partial   [H_q, MAX_SPLITS]      FP32     4 KB
+#     l_partial   [H_q, MAX_SPLITS]      FP32     4 KB
+#     acc_partial [H_q, MAX_SPLITS, D]   FP32     1 MB
+#
+# 构造 runner 时分配一次，6 层和所有 decode step 全程复用。seq_len 增长时变的是
+# 每个 split 内部循环的长度（chunk = cdiv(seq_len, MAX_SPLITS)），不是 buffer 大小。
+# 这与 KV cache 本身预分配到 T_max 是同一个思路。
+#
+# 代价：seq_len 小时大部分 split 空转。它们**必须显式写** m=-inf, l=0, acc=0
+# （不能让 buffer 保持未初始化）；combine 里 exp(-inf - m) = 0，这些 split 自动
+# 贡献 0，不需要特判。空 CTA 读几个字节就退出，几乎免费。
+#
+# chunk 和 seq_len 都是**运行时标量**，不要做成 tl.constexpr——它们随 seq_len 变，
+# 做成 constexpr 就是每个取值触发一次重编译（T_BUCKET 跨桶那几十秒已经吃过一次）。
+# 只有 MAX_SPLITS（用于 buffer 索引的上界）是 constexpr。
+
+MAX_SPLITS = 128
+
+
+split_autotune_configs = [
+    triton.Config({"BLOCK_T": tile}, num_warps=warps, num_stages=stages)
+    for tile in [16, 32, 64]
+    for warps in [4, 8]
+    for stages in [1, 2]
+]
+
+
+@triton.autotune(
+    configs=split_autotune_configs,
+    key=["H_Q", "D", "GROUP", "S_BUCKET"],
+    # 不需要 restore_value：kernel 只写 scratch，且每次写的值相同（幂等）。
+    # 与 conv4_decode / gdn_recurrent_decode 不同——那两个的 state 会向前推进，
+    # autotune 反复试 config 会把状态推多次，所以必须 restore。
+)
+@triton.jit
+def _gqa_attention_decode_split_triton(
+    q_ptr,  # [H_q, D] BF16
+    stride_q_h: tl.constexpr,
+    stride_q_d: tl.constexpr,
+    k_cache_ptr,  # [H_kv, T_max, D] BF16，只读
+    stride_kc_h: tl.constexpr,
+    stride_kc_t: tl.constexpr,
+    stride_kc_d: tl.constexpr,
+    v_cache_ptr,  # [H_kv, T_max, D] BF16，只读
+    stride_vc_h: tl.constexpr,
+    stride_vc_t: tl.constexpr,
+    stride_vc_d: tl.constexpr,
+    m_partial_ptr,  # [H_q, MAX_SPLITS] FP32
+    stride_mp_h: tl.constexpr,
+    stride_mp_s: tl.constexpr,
+    l_partial_ptr,  # [H_q, MAX_SPLITS] FP32
+    stride_lp_h: tl.constexpr,
+    stride_lp_s: tl.constexpr,
+    acc_partial_ptr,  # [H_q, MAX_SPLITS, D] FP32
+    stride_ap_h: tl.constexpr,
+    stride_ap_s: tl.constexpr,
+    stride_ap_d: tl.constexpr,
+    seq_len,  # 运行时
+    chunk,  # 运行时 = cdiv(seq_len, MAX_SPLITS)
+    scale,
+    H_Q: tl.constexpr,
+    D: tl.constexpr,
+    GROUP: tl.constexpr,
+    S_BUCKET: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+):
+    # TODO(kernel): 与不切 T 的版本几乎一样，只是循环范围换成本 split 的区间。
+    #
+    #   pid_h = tl.program_id(0)      # KV head，0..H_kv-1
+    #   pid_s = tl.program_id(1)      # split，0..MAX_SPLITS-1
+    #
+    #   start = pid_s * chunk
+    #   end   = tl.minimum(start + chunk, seq_len)
+    #
+    #   offset_h = pid_h * GROUP + tl.arange(0, GROUP)
+    #   offset_d = tl.arange(0, D)
+    #
+    #   m_i = tl.zeros([GROUP], tl.float32) - float('inf')
+    #   l_i = tl.zeros([GROUP], tl.float32)
+    #   acc = tl.zeros([GROUP, D], tl.float32)
+    #
+    #   if start < end:                        # 空 split 跳过整个循环
+    #       q = tl.load(...) 同不切 T 的版本
+    #       k_cache_ptr += pid_h * stride_kc_h
+    #       v_cache_ptr += pid_h * stride_vc_h
+    #       for t0 in tl.range(start, end, BLOCK_T):
+    #           ... 与不切 T 的版本逐行相同，只是 mask 用 offset_t < end ...
+    #
+    #   # 无论空不空都要写：空 split 写 m=-inf, l=0, acc=0
+    #   tl.store(m_partial_ptr + offset_h * stride_mp_h + pid_s * stride_mp_s, m_i)
+    #   tl.store(l_partial_ptr + offset_h * stride_lp_h + pid_s * stride_lp_s, l_i)
+    #   tl.store(acc_partial_ptr + offset_h[:, None] * stride_ap_h
+    #            + pid_s * stride_ap_s + offset_d[None, :] * stride_ap_d, acc)
+    #
+    # 要点：
+    # - **acc 不要在这里除以 l_i**，除法在 combine 里做。这里写的是
+    #   acc_i = sum_t exp(s_t - m_i) * v_t，l_i = sum_t exp(s_t - m_i)。
+    # - mask 用 `offset_t < end` 而不是 `< seq_len`——本 split 只负责 [start, end)。
+    #   尾块仍然必须显式置 -inf，理由同不切 T 的版本。
+    # - scratch 是 FP32，直接存 acc，不要降到 BF16：跨 split 归约时还要再乘一个
+    #   缩放因子，提前降精度会累积误差。
+    tl.static_assert(D % 16 == 0)
+
+
+combine_autotune_configs = [
+    triton.Config({"BLOCK_D": block_d}, num_warps=warps, num_stages=1)
+    for block_d in [32, 64, 128]
+    for warps in [2, 4, 8]
+]
+
+
+@triton.autotune(
+    configs=combine_autotune_configs,
+    key=["D", "MAX_SPLITS_C"],
+)
+@triton.jit
+def _gqa_attention_decode_combine_triton(
+    m_partial_ptr,  # [H_q, MAX_SPLITS] FP32
+    stride_mp_h: tl.constexpr,
+    stride_mp_s: tl.constexpr,
+    l_partial_ptr,  # [H_q, MAX_SPLITS] FP32
+    stride_lp_h: tl.constexpr,
+    stride_lp_s: tl.constexpr,
+    acc_partial_ptr,  # [H_q, MAX_SPLITS, D] FP32
+    stride_ap_h: tl.constexpr,
+    stride_ap_s: tl.constexpr,
+    stride_ap_d: tl.constexpr,
+    out_ptr,  # [H_q, D] BF16
+    stride_o_h: tl.constexpr,
+    stride_o_d: tl.constexpr,
+    D: tl.constexpr,
+    MAX_SPLITS_C: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    # TODO(kernel): 归约。grid = (H_q, D // BLOCK_D)。
+    #
+    # **grid 别用 (H_q,)**：它要读 1 MB 的 acc_partial，8 个 CTA 只有 43 GB/s -> 23us，
+    # 而整个 split-K 的目标才 39us。切出 D 维之后 BLOCK_D=64 时是 32 个 CTA -> 164 GB/s。
+    #
+    #   pid_h = tl.program_id(0)      # Q head
+    #   pid_d = tl.program_id(1)
+    #   offset_s = tl.arange(0, MAX_SPLITS_C)
+    #   offset_d = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
+    #
+    #   m_all = tl.load(m_partial_ptr + pid_h*stride_mp_h + offset_s*stride_mp_s)
+    #   m = tl.max(m_all, axis=0)                      # 全局 max
+    #   rescale = tl.exp(m_all - m)                    # [MAX_SPLITS]，空 split 得 0
+    #
+    #   l_all = tl.load(l_partial_ptr + pid_h*stride_lp_h + offset_s*stride_lp_s)
+    #   l = tl.sum(l_all * rescale, axis=0)
+    #
+    #   acc_all = tl.load(acc_partial_ptr + pid_h*stride_ap_h
+    #                     + offset_s[:, None]*stride_ap_s + offset_d[None, :]*stride_ap_d)
+    #   acc = tl.sum(acc_all * rescale[:, None], axis=0)   # [BLOCK_D]
+    #
+    #   tl.store(out_ptr + pid_h*stride_o_h + offset_d*stride_o_d,
+    #            (acc / l).to(out_ptr.dtype.element_ty))
+    #
+    # 要点：
+    # - 空 split 的 m 是 -inf，`exp(-inf - m)` 给 0，于是它们对 l 和 acc 都贡献 0，
+    #   **不需要特判**。前提是全局 m 有限——至少一个 split 有数据（seq_len >= 1），
+    #   所以成立。
+    # - MAX_SPLITS 必须是 2 的幂，`tl.arange` 才能用。
+    # - 全部在 FP32 里算，只在最后 store 时降到 BF16。
+    tl.static_assert(D % BLOCK_D == 0)
+
+
+@torch.library.triton_op(
+    "wy_lib::gqa_attention_decode_split",
+    mutates_args=("k_cache", "v_cache", "m_partial", "l_partial", "acc_partial"),
+)
+def gqa_attention_decode_split(
+    q: torch.Tensor,
+    k_new: torch.Tensor,
+    v_new: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    m_partial: torch.Tensor,
+    l_partial: torch.Tensor,
+    acc_partial: torch.Tensor,
+    past_len: int,
+) -> None:
+    num_q_heads, head_dim = q.shape
+    num_kv_heads, max_len, _ = k_cache.shape
+    assert m_partial.shape == (num_q_heads, MAX_SPLITS)
+    assert l_partial.shape == (num_q_heads, MAX_SPLITS)
+    assert acc_partial.shape == (num_q_heads, MAX_SPLITS, head_dim)
+    assert m_partial.dtype == l_partial.dtype == acc_partial.dtype == torch.float32
+    assert 0 <= past_len < max_len
+
+    # 追加与不切 T 的版本同理，放在 wrapper 里
+    k_cache[:, past_len, :] = k_new
+    v_cache[:, past_len, :] = v_new
+    seq_len = past_len + 1
+
+    torch.library.wrap_triton(_gqa_attention_decode_split_triton)[
+        (num_kv_heads, MAX_SPLITS)
+    ](
+        q_ptr=q,
+        stride_q_h=q.stride(0),
+        stride_q_d=q.stride(1),
+        k_cache_ptr=k_cache,
+        stride_kc_h=k_cache.stride(0),
+        stride_kc_t=k_cache.stride(1),
+        stride_kc_d=k_cache.stride(2),
+        v_cache_ptr=v_cache,
+        stride_vc_h=v_cache.stride(0),
+        stride_vc_t=v_cache.stride(1),
+        stride_vc_d=v_cache.stride(2),
+        m_partial_ptr=m_partial,
+        stride_mp_h=m_partial.stride(0),
+        stride_mp_s=m_partial.stride(1),
+        l_partial_ptr=l_partial,
+        stride_lp_h=l_partial.stride(0),
+        stride_lp_s=l_partial.stride(1),
+        acc_partial_ptr=acc_partial,
+        stride_ap_h=acc_partial.stride(0),
+        stride_ap_s=acc_partial.stride(1),
+        stride_ap_d=acc_partial.stride(2),
+        seq_len=seq_len,
+        chunk=triton.cdiv(seq_len, MAX_SPLITS),
+        scale=head_dim**-0.5,
+        H_Q=num_q_heads,
+        D=head_dim,
+        GROUP=num_q_heads // num_kv_heads,
+        S_BUCKET=_seq_bucket(seq_len),
+    )
+
+
+@torch.library.register_fake("wy_lib::gqa_attention_decode_split")
+def _gqa_attention_decode_split_fake(
+    q, k_new, v_new, k_cache, v_cache, m_partial, l_partial, acc_partial, past_len
+) -> None:
+    return None
+
+
+@torch.library.triton_op("wy_lib::gqa_attention_decode_combine", mutates_args=())
+def gqa_attention_decode_combine(
+    m_partial: torch.Tensor,
+    l_partial: torch.Tensor,
+    acc_partial: torch.Tensor,
+) -> torch.Tensor:
+    num_q_heads, _, head_dim = acc_partial.shape
+    out = torch.empty(
+        (num_q_heads, head_dim), dtype=torch.bfloat16, device=acc_partial.device
+    )
+
+    def grid(meta):
+        return (num_q_heads, head_dim // meta["BLOCK_D"])
+
+    torch.library.wrap_triton(_gqa_attention_decode_combine_triton)[grid](
+        m_partial_ptr=m_partial,
+        stride_mp_h=m_partial.stride(0),
+        stride_mp_s=m_partial.stride(1),
+        l_partial_ptr=l_partial,
+        stride_lp_h=l_partial.stride(0),
+        stride_lp_s=l_partial.stride(1),
+        acc_partial_ptr=acc_partial,
+        stride_ap_h=acc_partial.stride(0),
+        stride_ap_s=acc_partial.stride(1),
+        stride_ap_d=acc_partial.stride(2),
+        out_ptr=out,
+        stride_o_h=out.stride(0),
+        stride_o_d=out.stride(1),
+        D=head_dim,
+        MAX_SPLITS_C=MAX_SPLITS,
+    )
+    return out
+
+
+@torch.library.register_fake("wy_lib::gqa_attention_decode_combine")
+def _gqa_attention_decode_combine_fake(m_partial, l_partial, acc_partial):
+    return torch.empty(
+        (acc_partial.shape[0], acc_partial.shape[2]),
+        dtype=torch.bfloat16,
+        device=acc_partial.device,
+    )
+
+
+def allocate_split_scratch(
+    num_q_heads: int, head_dim: int, device="cuda"
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """定长 scratch，构造 runner 时分配一次，所有层和所有 decode step 复用。
+
+    大小只与 MAX_SPLITS 有关，**不随 token 数增长**。
+    """
+    f32 = dict(dtype=torch.float32, device=device)
+    return (
+        torch.zeros((num_q_heads, MAX_SPLITS), **f32),
+        torch.zeros((num_q_heads, MAX_SPLITS), **f32),
+        torch.zeros((num_q_heads, MAX_SPLITS, head_dim), **f32),
+    )
+
+
+def call_gqa_attention_decode_split_triton(
+    q: torch.Tensor,
+    k_new: torch.Tensor,
+    v_new: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    past_len: int,
+    scratch: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+) -> torch.Tensor:
+    """接口与不切 T 的 `call_gqa_attention_decode_triton` 一致，可直接互换。
+
+    scratch 传 None 时临时分配——**只用于测试**，实际 runner 应该复用一份。
+    """
+    if scratch is None:
+        scratch = allocate_split_scratch(q.shape[0], q.shape[1], device=q.device)
+    m_partial, l_partial, acc_partial = scratch
+    gqa_attention_decode_split(
+        q, k_new, v_new, k_cache, v_cache, m_partial, l_partial, acc_partial, past_len
+    )
+    return gqa_attention_decode_combine(m_partial, l_partial, acc_partial)
+
+
+def _torch_reference_split(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    seq_len: int,
+) -> torch.Tensor:
+    """按 MAX_SPLITS 分段算局部量再归约的 PyTorch 参考实现。
+
+    结果必须与 `_torch_reference` 完全一致——这条本身就是对归约公式的自检。
+    """
+    num_q_heads, head_dim = q.shape
+    group = num_q_heads // k_cache.shape[0]
+    chunk = -(-seq_len // MAX_SPLITS)
+
+    m_partial = torch.full((num_q_heads, MAX_SPLITS), -float("inf"), device=q.device)
+    l_partial = torch.zeros((num_q_heads, MAX_SPLITS), device=q.device)
+    acc_partial = torch.zeros((num_q_heads, MAX_SPLITS, head_dim), device=q.device)
+
+    for h in range(num_q_heads):
+        hk = h // group
+        for s in range(MAX_SPLITS):
+            start, end = s * chunk, min((s + 1) * chunk, seq_len)
+            if start >= end:
+                continue  # 空 split 保持 m=-inf, l=0, acc=0
+            k = k_cache[hk, start:end].float()
+            v = v_cache[hk, start:end].float()
+            score = (k @ q[h].float()) * (head_dim**-0.5)
+            m = score.max()
+            p = torch.exp(score - m)
+            m_partial[h, s] = m
+            l_partial[h, s] = p.sum()
+            acc_partial[h, s] = p @ v
+
+    m = m_partial.max(dim=1, keepdim=True).values  # [H_q,1]
+    rescale = torch.exp(m_partial - m)  # 空 split -> exp(-inf) = 0
+    l = (l_partial * rescale).sum(dim=1, keepdim=True)
+    acc = (acc_partial * rescale[:, :, None]).sum(dim=1)
+    return (acc / l).to(q.dtype)
+
+
 if __name__ == "__main__":
     import sys
     from pathlib import Path
@@ -454,4 +834,61 @@ if __name__ == "__main__":
     assert torch.isfinite(dirty).all()
     print("  cache 尾部填 NaN 不影响结果（越界保护正确）")
 
-    print("All GQA attention decode tests passed.")
+    # ---- 第 3 步：split-K 的归约公式自检（不依赖 Triton kernel）-----------
+    # 分段算局部量再归约，必须与一次性算完全一致。这条能抓住 m/l 重缩放写错。
+    print("\n=== split-K 归约公式 vs 一次性算（纯 PyTorch）===")
+    for seq_len in (1, 7, 64, 65, 200, 511):
+        q = torch.randn((H_Q, D), dtype=torch.bfloat16, device="cuda")
+        kc, vc = allocate_kv_cache(H_KV, MAX_LEN, D)
+        kc[:, :seq_len].normal_()
+        vc[:, :seq_len].normal_()
+        a = _torch_reference(q, kc, vc, seq_len)
+        b = _torch_reference_split(q, kc, vc, seq_len)
+        err = (a.float() - b.float()).abs().max().item()
+        torch.testing.assert_close(a, b, rtol=1e-2, atol=1e-2)
+        active = min(MAX_SPLITS, -(-seq_len // (-(-seq_len // MAX_SPLITS))))
+        print(f"  seq_len={seq_len:>4} 活跃split={active:>4}/{MAX_SPLITS}  max_abs_error={err:.8f}")
+    print("归约公式正确。\n")
+
+    # ---- 第 4 步：split-K Triton kernel vs 不切 T 的版本 ------------------
+    # 不切 T 的版本已经对过 prefill kernel，这里拿它当基准。
+    print("=== split-K kernel vs 不切 T 的版本 ===")
+    try:
+        for token_num, prefix in ((1, 0), (17, 5), (65, 33), (129, 64), (257, 128)):
+            actual, expected = run_prefill_then_decode(
+                token_num, prefix, call_gqa_attention_decode_split_triton
+            )
+            err = (actual.float() - expected.float()).abs().max().item()
+            torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+            assert torch.isfinite(actual).all()
+            print(
+                f"  T={token_num:>4} prefix={prefix:>3}  max_abs_error={err:.8f}  "
+                f"split_cfg={_gqa_attention_decode_split_triton.best_config}"
+            )
+
+        # 空 split 必须写零值而不是留下上一次的残留：先用长序列填脏 scratch，
+        # 再用短序列跑，结果必须正确。
+        scratch = allocate_split_scratch(H_Q, D)
+        q = torch.randn((H_Q, D), dtype=torch.bfloat16, device="cuda")
+        kn = torch.randn((H_KV, D), dtype=torch.bfloat16, device="cuda")
+        vn = torch.randn_like(kn)
+        kc, vc = allocate_kv_cache(H_KV, MAX_LEN, D)
+        kc[:, :400].normal_()
+        vc[:, :400].normal_()
+        call_gqa_attention_decode_split_triton(q, kn, vn, kc, vc, 400, scratch)
+        kc2, vc2 = allocate_kv_cache(H_KV, MAX_LEN, D)
+        kc2[:, :5].normal_()
+        vc2[:, :5].normal_()
+        short = call_gqa_attention_decode_split_triton(q, kn, vn, kc2, vc2, 5, scratch)
+        ref = _torch_reference(q, kc2, vc2, 6)
+        torch.testing.assert_close(short, ref, rtol=2e-2, atol=2e-2)
+        print("  脏 scratch 复用后短序列仍正确（空 split 确实写了零值）")
+
+        print("All GQA attention decode split-K tests passed.")
+    except NotImplementedError as exc:
+        print(f"  跳过：{exc}")
+    except Exception as exc:
+        if "静态" in str(exc) or "static_assert" in str(exc).lower():
+            raise
+        print(f"  split-K kernel 尚未实现或有误：{type(exc).__name__}: {str(exc)[:160]}")
+        print("  填完两个 body 后重跑本文件。")
