@@ -16,7 +16,7 @@
 
 模型文件位于 `Qwen3.5-0.8B/`。完整模型结构和算子调研见 `README.md`；README 中第 3 节（视觉塔）、第 4 节（MTP）以及算子清单里标记为 `V` 的条目当前都不在范围内。
 
-关于 cache 的现状：GDN 两个 cache 的 decode kernel 都已就位——`gdn_recurrent_decode` 原地更新 `[16,128,128]` FP32 recurrent state（3.10b），`depthwise_causal_conv4_decode` 原地更新 `[6144,4]` BF16 conv state（3.8b），两者都验证过「prefill 前缀 + 逐 token decode」与整段 prefill 一致。**还差 full attention 的 KV cache**，缺了它 runner 就切不到增量 decode，所以当前仍按「每生成一个 token，对增长后的完整序列重新执行一次 forward」实现。
+关于 cache 的现状：GDN 两个 cache 的 decode kernel 都已就位——`gdn_recurrent_decode` 原地更新 `[16,128,128]` FP32 recurrent state（3.10b），`depthwise_causal_conv4_decode` 原地更新 `[4,6144]` BF16 conv state（3.8b），两者都验证过「prefill 前缀 + 逐 token decode」与整段 prefill 一致。**还差 full attention 的 KV cache**，缺了它 runner 就切不到增量 decode，所以当前仍按「每生成一个 token，对增长后的完整序列重新执行一次 forward」实现。
 
 无论走哪条路，Gated DeltaNet 在单次 forward 内必须按 token 顺序维护 recurrent state；完整重算时从零状态开始。
 
@@ -211,10 +211,31 @@ depthwise causal Conv4 融合 SiLU。已测试 `T=1,2,3,4,17,65`、模型 `D=614
 
 ```text
 x:      [1,D] BF16      新 token 的 in_proj_qkv 输出，模型 D=6144
-state:  [D,4] BF16      原地更新
-weight: [D,1,4] 或 [D,4] BF16    与 prefill 版共用同一份权重
+state:  [4,D] BF16      原地更新，必须 contiguous
+weight: [4,D] BF16      必须 contiguous，用 conv_weight_for_decode() 从
+                        checkpoint 的 [D,1,4] 转换
 out:    [1,D] BF16      含 SiLU
 ```
+
+**注意是 `[4,D]` 不是 `[D,4]`。** kernel 里一个线程负责一个 channel，取第 k 个 tap 时
+`[D,4]` 下相邻线程相隔 4 个元素（32 字节的访存粒度里只用 4/16），`[4,D]` 下地址连续、
+完全合并。A100 实测（CUDA Graph，D=6144）：
+
+```text
+布局                      BLOCK=256   BLOCK=512   BLOCK=1024
+state[D,4] weight[D,4]     1.88us      2.48us      5.14us
+state[4,D] weight[D,4]     1.68us      1.95us      3.27us
+state[4,D] weight[4,D]     1.60us      1.69us      1.89us   ← 采用
+```
+
+除了更快，`[4,D]` 对 BLOCK_D 几乎不敏感，autotune 才有实际选择空间。
+
+两个张量都必须是**真正 contiguous 的 `[4,D]`**，不能是 `[D,4]` 的转置 view——
+转置 view 数值上正确但内存布局仍是 `[D,4]`，合并访问的好处全没了。wrapper 里有
+assert 挡着，测试里也有一条专门验证它会被拒绝。
+
+因此 decode 需要一份独立于 prefill 的权重副本（prefill 用 `[D,1,4]`），
+在 loader 里转一次，18 层多占 0.86 MiB。
 
 conv kernel size 是 4，算 `y[t]` 要用 `x[t-3..t]`，decode 时只有 `x[t]` 是新的，
 前三个从 state 取。**注意这与 delta rule 的 `[16,128,128]` recurrent state 是两个
@@ -222,33 +243,39 @@ conv kernel size 是 4，算 `y[t]` 要用 `x[t-3..t]`，decode 时只有 `x[t]`
 不是 conv 输出、也不是 SiLU 之后的值。18 层合计 0.84 MiB。
 
 约定对齐 transformers 的 `causal_conv1d_update`（`state_len = conv_kernel_size = 4`）：
-更新后 `state[c,:]` 恰好是 `x[t-3..t]`，点积不用再做下标偏移。
+更新后 `state[:,c]` 恰好是 `x[t-3..t]`，点积不用再做下标偏移。
 
 ```text
-state[c,:] = concat(state[c,1:], x[c])          # 左移一格，新值放末尾
-acc  = sum_{r=0..3} weight[c,r] * state[c,r]    # FP32 累加
+state[:,c] = concat(state[1:,c], x[c])          # 左移一格，新值放末尾
+acc  = sum_{r=0..3} weight[r,c] * state[r,c]    # FP32 累加
 y[c] = acc * sigmoid(acc)
 ```
 
-实现上不需要 concat：kernel 里"移位"就是变量重命名（读 state 的第 1/2/3 列，
-写回第 0/1/2 列，第 3 列写新值），第 0 列干脆不读。`tl.cat` 在这里**用不了**——
+实现上不需要 concat：kernel 里"移位"就是变量重命名（读 state 的第 1/2/3 行，
+写回第 0/1/2 行，第 3 行写新值），第 0 行干脆不读。`tl.cat` 在这里**用不了**——
 `[BLOCK_D,3]` 的 3 不是 2 的幂，会报 `Shape element 1 must be a power of 2`。
 depthwise 通道间不混合，**不要用 `tl.dot`**。
+
+kernel body 对布局是无感的——指针算术全靠 stride 参数驱动，从 `[D,4]` 换到 `[4,D]`
+时 kernel 一行没改，只是 wrapper 里 `stride_state_d`/`stride_state_k` 的来源
+从 `stride(0)`/`stride(1)` 换成了 `stride(1)`/`stride(0)`。
 
 和 `gdn_recurrent_decode` 一样声明了 `mutates_args=("state",)`，autotune 配
 `restore_value=["state_ptr"]`——不加的话调优反复试 config 会把 state 推进多次。
 **调用方要注意这个 op 会就地改写传入的 state。**
 
-配套工具 `conv_state_from_prefill(x) -> [D,4]`：从 prefill 的 conv 输入建初始 state，
-取最后 4 行，`T < 4` 时左侧补零。
+配套工具：`conv_state_from_prefill(x) -> [4,D]` 从 prefill 的 conv 输入建初始 state
+（取最后 4 行，`T < 4` 时上方补零）；`conv_weight_for_decode(w) -> [4,D]` 从 checkpoint
+布局转换权重。
 
 测试分两段：先验证 PyTorch 参考实现与 prefill kernel 一致（不依赖 Triton kernel），
 再验证 Triton kernel 与参考实现一致。判据都是「prefill 前 n 个 token → 拿 state →
 逐 token decode 剩下的」必须等于整段 prefill。覆盖 `T=1,2,3,4,17,65`（前四个专门
 覆盖 `T<4` 的左侧补零路径）和通用 `D=1000`，最大绝对误差全部为 0。
 
-访存量只有 `读 9D + 写 5D` ≈ 172 KiB，纯 launch-bound，autotune 选了最小的
-`BLOCK_D=256`；不必在它的 tiling 上花心思。
+访存量只有 `读 9D + 写 5D` ≈ 172 KiB。注意 eager 下单次调用要 89.4μs（几乎全是
+`torch.library` 分发，见 8.2），而 kernel 本身只有 1.6μs——**这个 kernel 的任何
+进一步优化都量不出来**，除非先把调用开销解决掉。
 
 ### 3.9 `gdn_qk_norm_gates.py` — `wy_lib::gdn_qk_norm_gates`
 
