@@ -419,36 +419,41 @@ delta  = u_base - w @ state_in
 
 `P` 用前代法逐行求逆（`for row in tl.range(1, BLOCK_T)`）。三段的并行度分别是 `(chunk, head)`、`(head, v_tile)`（chunk 间串行）、`(chunk, head, v_tile)`。
 
-**这条路径当前比 sequential 慢约 20 倍，不能直接切换。** CUDA event 实测（`H=16, DK=DV=128`，
-折算成 18 层）：
+**这条路径已优化，现在比 sequential 快 4.1x**（T=2048，`H=16, DK=DV=128`）：
 
 ```text
-T=32    sequential  2.29ms   chunked  46.16ms
-T=128   sequential  2.34ms   chunked  64.25ms
-T=1024  sequential 19.41ms   chunked 351.61ms
+                改前        改后      倍数
+prepare_wy     4.146ms    0.338ms    12.3x
+chunk_state    1.630ms    0.256ms     6.4x
+chunk_output  32.402ms    0.105ms   308x
+────────────────────────────────────────────
+chunked       38.228ms    0.682ms    56x
+sequential     2.801ms
 ```
 
-主要原因在 `prepare_wy`：求 `P=(I+L)^-1` 用的是 `for row in tl.range(1, BLOCK_T)`
-的逐行前代法，64 步串行，每步还做一次 `[64,64]` 的全矩阵规约；同时一个 program
-一次性 materialize 全部 `64×64` 和 `64×DK` 中间量，寄存器压力很大。注释里自称
-「简单正确性版本」，确实只能算正确性版本。
+改动是精度（8 个 `tl.dot` 的 `input_precision="ieee"` 绕开了 tensor core）和
+`chunk_output` 的 `BLOCK_V` 硬编码（导致 attention 矩阵被 8 个 CTA 各算一遍），
+**算法本身没动**。完整推导见 8.13——尤其是"先测再改"那一段：原本认定瓶颈是
+`prepare_wy` 的逐行前代法，准备换成分块回代或 Newton 迭代，结果只改精度就够了，
+那套重写是白工。
 
-所以"切 chunk-64 提速"这件事**需要重写而不是切换**：至少要把前代法换成分块回代
-或 Newton 迭代求逆，并在 DK/DV 上分块。`chunk_state`/`chunk_output` 的 `BLOCK_V`
-硬编码为 16、没有 autotune，也是同一批待办。
+`runner._gdn` 按 `token_num >= 2048` 在两条路径间选。**阈值不是 kernel 级的交叉点
+（T≈192），而是模型级的（T≈2048）**，原因见 8.14。
 
-测试结果（2026-09-01 A100 实测，`H=16, DK=DV=128`）：
+测试结果（A100 实测，`H=16, DK=DV=128`；长序列档是这次补的）：
 
 ```text
-prepare_wy       T=1,3,63,64,65,129   max_abs_w 1e-8   max_abs_u 1.4e-6   max_abs_g 1.5e-5
-chunked prefill  T=1,3,63,64,65,129   max_abs_out 6.1e-5   max_abs_state 2.2e-6
-sequential       T=1,3,17,65          max_abs_out 3.1e-5   max_abs_state 9e-8
-prefill(17)+decode(48) 等价性          max_abs_out 3.1e-5   max_abs_state 9e-8
+prepare_wy       T=1,3,63,64,65,129,512,1025   max_abs_w 4e-8   max_abs_u 1.6e-6   max_abs_g 1.9e-5
+chunked prefill  T=1,3,63,64,65,129,512,1025   max_abs_out 1.2e-4   max_abs_state 1.9e-6
+sequential       T=1,3,17,65                   max_abs_out 3.1e-5   max_abs_state 9e-8
+prefill(17)+decode(48) 等价性                   max_abs_out 3.1e-5   max_abs_state 9e-8
 ```
 
 chunked 和 sequential 都以逐 token FP32 PyTorch 实现为 reference。三条路径互相一致。
+模型级上两条 prefill 路径的 hidden 差约 2.8%，但 greedy token 完全相同，
+理由见 8.14。
 
-**作者归属**：(a) sequential 和 (b) decode 由用户编写；(c) chunk-64 三段式由 Codex 生成，用户没有逐行审过。它的测试是过的，但如果后续在这条路径上遇到可疑数值，优先怀疑它而不是 sequential；对拍时也应该以 sequential 为基准。本仓库其余 kernel 均为用户编写。
+**作者归属**：(a) sequential 和 (b) decode 由用户编写；(c) chunk-64 三段式最初由 Codex 生成，用户没有逐行审过，后由 Claude 做了上述性能改造（算法未动）。对拍时仍以 sequential 为基准。本仓库其余 kernel 均为用户编写。
 
 ### 3.11 `gdn_gated_rmsnorm.py` — `wy_lib::gdn_gated_rmsnorm`
 
@@ -1009,8 +1014,31 @@ seq_len=4095  BLOCK_T=32 warps=4 stages=2   14.51us
 ```
 
 拿短序列调出的 config 跑长序列只是慢一点、不会算错（correctness 全部由显存里的
-`pos` 决定）。当前跨度不大——12.5 → 14.5μs，而且大部分是序列变长本身带来的，
-不是 config 选差了——所以单张图够用。
+`pos` 决定）。
+
+**但上面这张表不能用来估算"每 bucket 一张图能赢多少"**，这里曾经犯过一次错。
+它同时变了两件事：config 变了，序列也变长了。而序列变长的代价是物理的，
+多少张图都省不掉。要隔离 config，得固定 seq_len、只改"冻结了哪个 config"——
+也就是把短 prompt 时捕获的图拿去跑长序列（在图里测，否则 110μs 的 eager
+分发开销会把 13μs 的差异整个盖住）：
+
+```text
+seq=  64 用自己的 config                    13.06us
+seq=  64 用 4096 的 config                  13.38us     +2.4%
+seq=4095 用自己的 config                    15.72us
+seq=4095 用   64 的 config ← 短捕获长 replay  16.15us     +2.7%
+
+序列 64 -> 4095 本身                                    +20.3%   ← 上表那 16% 是这个
+```
+
+**config 冻结的真实代价是 2.7%，不是 16%。** 而且还要再折一次：attention decode
+只有 6 层，6 × 16μs ≈ 96μs，占 4.4ms 一步的 2.2%。所以每 bucket 一张图值
+`2.7% × 2.2% ≈ 0.06%`。结论仍然是单张图够用，但理由是"这条路根本没什么可赢的"，
+不是"跨度只有 16%"。要提速应该去看那 4.4ms 里剩下的 97.8%。
+
+顺带一个副产品：中途误测了不分 split 的 `gqa_attention_decode`，seq=4095 要
+170μs（grid 只有 2 个 CTA）。这反过来印证了 8.6 节坚持做 split-K 是对的——
+split-K 把它从 170μs 压到 15.7μs。
 
 要做得更好，方向是**每个 bucket 捕获一张图**，按 host 已知的 seq_len 选：
 
@@ -1186,6 +1214,134 @@ CPU/GPU 流水，打算"批量 replay N 步再统一检查"（代价是最多多
 （"CUDA error: device-side assert triggered"）。所以在 host 侧提前 assert 并给出
 具体数字——这个坑我们踩过两次（一次在测 graph 内存池时，一次在这里）。
 
+### 8.13 GDN chunk-64 prefill：38.2ms -> 0.68ms（56x）
+
+这个三阶段 kernel 之前一直挂着"比 sequential 慢 20x，需要重写"的标签。实测下来
+**不需要重写算法，问题全在两处实现细节上**，改完从慢 13.6x 变成快 4.1x。
+
+T=2048、H=16、DK=DV=128 的逐阶段拆解：
+
+```text
+                改前        改后      倍数
+prepare_wy     4.146ms    0.338ms    12.3x
+chunk_state    1.630ms    0.256ms     6.4x
+chunk_output  32.402ms    0.105ms   308x
+────────────────────────────────────────────
+chunked       38.228ms    0.682ms    56x
+sequential     2.801ms    2.801ms
+比值            13.6x 慢    4.1x 快
+```
+
+**问题一：8 个 `tl.dot` 全都带 `input_precision="ieee"`。**
+sm80 上这会绕开 tensor core 走 FP32 软件模拟。算一下就知道有多离谱：T=2048 时
+chunk_output 约 2.15 GFLOP / 32.4ms = **67 GFLOPS**，而 A100 的 BF16 峰值是
+312 TFLOPS，就算是 FP32 非 tensor core 也有 19.5 TFLOPS。
+
+改法要分操作数的实际 dtype 来定，不能一刀切：
+
+| 点乘 | 操作数 | 处理 |
+|---|---|---|
+| `q @ kᵀ`（output）、`k @ kᵀ`（wy） | 两边显存里就是 BF16 | 直接用 BF16。**结果与 ieee 等价**——BF16 乘积需 16 位尾数，FP32 累加器（24 位）装得下，是精确的，只差累加顺序 |
+| `attention @ delta`、`inverse @ ...`、`w @ state` | 至少一边是真 FP32 | `tf32x3`（三次 TF32 拼出接近 FP32） |
+| `q @ state_in`（output） | q 是 BF16，state 是 FP32 | 裸 TF32 即可 |
+
+最后一行是实测挑出来的，不是拍脑袋：先全用裸 TF32，整体相对误差从 1.7e-3 涨到
+6.8e-3；单独把 `q @ state_in` 换成 tf32x3——**误差纹丝不动（还是 6.8e-3），
+却多花了 2.9ms**；反过来只把 `attention @ delta` 换成 tf32x3，误差降回 1.0–3.4e-3
+而耗时只从 0.103 涨到 0.105ms。**误差全部来自那一个点乘。** 教训是：
+tf32x3 的代价与操作数尺寸强相关（这里 state_in 是 [128,128] 的 FP32 tile，
+拆分开销远大于 [64,64] 的 attention），所以要逐个测，不要整片套用。
+
+**问题二：`chunk_output` 的 `BLOCK_V=16` 是写死的。**
+`grid` 的 z 维 = DV/BLOCK_V = 8，而 kernel 里 `q`、`k`、`qk = q @ kᵀ`、
+`exp(gated_diff)` 和因果掩码**都与 `pid_v` 无关**——8 个 CTA 把同一份 [64,64]
+的 attention 矩阵各算了一遍。改成 autotune（BLOCK_V ∈ {32,64,128}）后选到 128，
+z 维变 1，这部分直接省掉 7/8。
+
+**`chunk_state` 的 `BLOCK_V=16` 反而是对的，没动。** 它在 chunk 方向是串行扫描，
+并行度只有 `H × DV/BLOCK_V = 16 × 8 = 128` 个 CTA；BLOCK_V 开到 128 的话
+CTA 数掉到 16，喂不满 108 个 SM。同一个参数在两个 kernel 里的最优值相反，
+因为一个的并行度来自 chunk 维、另一个只能来自 V 维。
+
+**先测再改救了一次。** 一开始认定 `prepare_wy` 的瓶颈是那个 63 次迭代的前向替换
+循环（每次对整个 [64,64] 做三遍跨 lane 归约），正准备换成 Neumann 倍增或分块
+求逆。结果只改精度就从 4.146 降到 0.333ms——循环根本不是瓶颈，那套重写完全是
+白工。
+
+**测试覆盖补了长序列。** 原来的 `test_cases` 只到 T=129，即最多 3 个 chunk，
+而误差是沿 chunk 方向累积的。加了 512 和 1025 之后 state 误差 1.9e-6（判据 5e-4）、
+out 误差 1.2e-4（判据 1e-2），余量都很大。
+
+另记一条：`k` 必须是 L2 归一化的（模型里 `gdn_qk_norm_gates` 保证了这点）。
+用裸 `randn`（‖k‖≈√DK）造测试数据会让 WY 变换的三角系统 `(I + tril(diag(β)·KKᵀ))`
+的元素到 O(DK)，前向替换直接发散成 Inf/NaN。这不是 kernel bug，但很容易误判成 bug。
+
+### 8.14 接进 runner：kernel 级交叉点 ≠ 模型级交叉点
+
+`_gdn` 里按 `token_num` 在两条路径间选。这里有个值得记住的坑：
+
+```text
+T       kernel 级（单层 GDN）        模型级（整个 prefill）
+        seq       chunk             seq       chunk
+ 512   0.702ms   0.224ms   3.1x    43.1ms    49.4ms   0.87x
+1536      —         —              48.2ms    49.2ms   0.98x
+2048   2.801ms   0.682ms   4.1x    66.9ms    47.7ms   1.40x
+3072      —         —             106.0ms    48.3ms   2.20x
+4096      —         —             141.5ms    63.6ms   2.23x
+```
+
+**kernel 级交叉点在 T≈192，模型级在 T≈2048，差一个数量级。** 两个原因都不在
+kernel 里：chunked 是三个 op 而 sequential 是一个，18 个 GDN 层就多 36 次分发；
+而 prefill 在 T<2048 时本来就是 CPU 分发受限的（下面 8.15），GPU 省下的时间露不
+出来，那 36 次分发却全额计入。所以 `GDN_CHUNKED_PREFILL_MIN_TOKENS = 2048`。
+
+**两条路径的数值差异，以及为什么可以接受。** 24 层之后 hidden 相对差约 2.8%、
+recurrent state 约 1.6%，数字看着不小。三条佐证说明这在噪声底以内：
+
+1. 模型自身对 HF oracle 的 hidden 误差就有 1.8%（6.3 节），同一个量级；
+2. **改精度之前的原版 chunked 路径同样偏离 2.3%**，所以不是 tensor core 化引入的，
+   是 chunk 与 sequential 累加顺序不同在 18 层上累积的固有差异；
+3. T=2048 和 3072 下，两条路径的 64 个 greedy token **逐个相同**。
+
+oracle 无法裁决这件事——它的 prompt 只有 19 个 token，只够一个 chunk，而单
+chunk 内两条路径本就等价（实测 final hidden 对 oracle 的误差两边都是 1.812e-2，
+四位有效数字相同）。要真正验证长序列数值，需要一个长 prompt 的 oracle，
+见第 9 节。
+
+`tests/test_decode_parity.py` 第 6 段覆盖这条路径，判据用 greedy token 序列而不是
+相对误差——理由如上。
+
+### 8.15 prefill 的 43ms 地板，以及它没走 compile 路径
+
+```text
+prompt   prefill    每 token
+    32    42.9ms    1342.1us
+   128    45.4ms     354.7us
+   512    43.3ms      84.6us
+  2048    66.9ms      32.7us
+```
+
+T 从 32 涨到 512，时间几乎不变。这个 43ms 和 8.1 节 eager decode 的 42ms/token
+是同一个数——**一次前向约 400 次 op 分发的 CPU 开销**。短 prompt 的 prefill 完全
+是分发受限，GPU 基本闲着。
+
+`compile=True` 对此**毫无作用**（43.6 vs 43.1ms）。原因：`prefill()` 直接调
+`self._forward(...)`，而 compile 的分支在 `forward()` 里（`runner.py:399`），
+prefill 从来没走过编译路径。这不是 bug，是当初接 cache 时没顾上——`_forward`
+带 `caches=` 时有原地写入，要进 compile 区域需要另外处理。
+
+顺带澄清一个用词：**prefill 不做"完整重算"**。"完整重算"特指不带 cache 的
+`forward()`/`generate()`——每生成一个 token 就把整个序列重算一遍，每 token O(T)、
+总共 O(T²)，只用于测试对拍。`prefill()` 复用的是同一份 `_forward` 代码（额外传
+`caches=` 让每层顺手写 cache），但**只跑一遍**。两者差多少：
+
+```text
+prompt   prefill 一遍   若真用完整重算逐 token 生成同样长度
+    32      42.9ms                ~0.7s
+   512      43.3ms               ~11.1s
+  2048      66.9ms               ~68.5s
+```
+
 ## 9. 剩余工作
 
 **正确性里程碑已达成**：13 个 kernel + loader + runner 打通，49 项逐算子对拍全部在容差内，oracle prompt 上端到端 greedy 32 个 token 与 Hugging Face 逐个相同（第 7 节）。注意 token 全对是 prompt 相关的，逐算子对拍才是稳定判据，见 7.3 末尾。
@@ -1221,14 +1377,34 @@ CPU/GPU 流水，打算"批量 replay N 步再统一检查"（代价是最多多
 
    齐了之后把 runner 拆成 prefill + decode 两条路径，用当前的完整重算版本做等价性
    对拍——**现在这个 runner 就是那个基准**（`compile=False` 那条路径逐算子对得上 HF）。
-3. **重写 chunk-64 prefill**。注意是重写不是切换：当前实现比 sequential 慢约 20 倍
-   （见 3.10），`prepare_wy` 里 64 步串行的前代法求逆是主因。要动就得把它换成分块回代
-   或 Newton 迭代，并在 DK/DV 上分块。优先级低于第 2 项，因为 prefill 只跑一次。
-4. **扩测试覆盖**：目前 oracle 只有一个 19 token 的中文 prompt。至少再加一个长 prompt
-   （跨过 chunk-64 和 `T_BUCKET` 边界，比如 T=65/129）和一个英文 prompt。
-5. **kernel 级性能收尾**：`gdn_qk_norm_gates` 的 head 分块、`chunk_state`/`chunk_output`
-   的 BLOCK_V autotune。**不包括 `gemm_2d`**——它已经是 cuBLAS 的 1.1-1.2 倍，达标了（8.5）。
-6. 可选：top-k/top-p/temperature sampling、batch/padding。
+3. ~~**重写 chunk-64 prefill**~~ **已完成**，见 8.13/8.14。结论与原计划不同：不需要
+   重写算法，慢是 `input_precision="ieee"` 绕开 tensor core + `BLOCK_V` 硬编码
+   造成的，改完 56x，现在比 sequential 快 4.1x 并已按 T≥2048 接进 `_gdn`。
+
+4. **拆掉 prefill 的 43ms 分发地板**（见 8.15）。这是现在 prefill 的实际瓶颈——
+   T<2048 时 GPU 基本闲着，8.13 那 56x 完全露不出来。两个方向：
+   - 让 `prefill()` 走 compile 路径。现在它直接调 `_forward` 绕过了 `forward()` 里的
+     compile 分支，而 `caches=` 的原地写入需要额外处理才能进编译区域。
+   - 按 T 分桶 + padding 给 prefill 也捕获 CUDA Graph。decode 能进图是因为 shape 恒定，
+     prefill 的 T 随 prompt 变，代价是每个桶一张图。
+   做成之后 `GDN_CHUNKED_PREFILL_MIN_TOKENS` 应该同步下调（现在的 2048 是被 CPU
+   地板顶上去的，kernel 级交叉点只有 192）。
+
+5. **扩测试覆盖**：目前 oracle 只有一个 19 token 的中文 prompt。**这条现在有了具体
+   的缺口**：8.14 里 chunked 与 sequential 在长序列上的 2.8% 差异无法被 oracle 裁决，
+   因为 19 个 token 只够一个 chunk，两条路径在单 chunk 内本就等价。需要一个
+   T≥2048 的长 prompt oracle（跑 `tools/dump_oracle.py`，在 `.venv-oracle` 里）。
+   另外再加一个英文 prompt。
+
+6. **kernel 级性能收尾**：`gdn_qk_norm_gates` 的 head 分块。
+   **不包括 `gemm_2d`**（已是 cuBLAS 的 1.1-1.2 倍，8.5）、
+   **也不包括 `chunk_state`/`chunk_output` 的 BLOCK_V**（8.13 已处理：chunk_output
+   接了 autotune；chunk_state 的 16 经分析是对的，开大反而把 CTA 数从 128 降到 16）。
+
+7. 可选：top-k/top-p/temperature sampling、batch/padding。注意当前
+   `lm_head_argmax` 把 LM head 的 GEMV 和 argmax 融在一个 kernel 里，
+   248320 维的 logits 从不物化——要做采样得改图的输出（出 logits 交给图外采样，
+   或把采样也放进图里，后者需要一个 capture 安全的 RNG，和 `pos.add_(1)` 一个套路）。
 
 host 侧还缺的：`tokenize_text.py` 目前只实现了单轮 non-thinking chat 模板的子集，多轮对话和 thinking 模式要补。停止 token（`<|im_end|>`=248046、`<|endoftext|>`=248044）已经在 runner 里作为默认值。
 

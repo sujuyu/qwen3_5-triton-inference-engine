@@ -34,6 +34,7 @@ from triton_kernels.depthwise_causal_conv4_decode import (
     depthwise_causal_conv4_decode,
 )
 from triton_kernels.gdn_recurrent_prefill import (
+    call_gdn_recurrent_prefill_chunked_triton,
     gdn_recurrent_decode,
     gdn_recurrent_prefill_sequential,
 )
@@ -55,6 +56,10 @@ from triton_kernels.vocab_argmax import lm_head_argmax
 # tokenizer_config 把 <|im_end|> 设为 EOS，text config 里还有 <|endoftext|>。
 # 停止 token 由调用层决定，这里只给默认值。
 DEFAULT_STOP_IDS = (248046, 248044)
+
+# GDN prefill 走 chunk-64 并行路径的最小 token 数，低于它用 sequential 递推。
+# 依据见 `_gdn` 里的实测表。注意这个阈值**不能**照搬 kernel 级的交叉点。
+GDN_CHUNKED_PREFILL_MIN_TOKENS = 2048
 
 
 class Qwen35Runner:
@@ -138,7 +143,31 @@ class Qwen35Runner:
         v = conv[:, 2 * key_dim : 3 * key_dim].view(token_num, heads, head_dim)
 
         q_n, k_n, beta, g = gdn_qk_norm_gates(q, k, a, b, w.a_log, w.dt_bias)
-        core, state = gdn_recurrent_prefill_sequential(q_n, k_n, v, beta, g)
+
+        # 两条 GDN prefill 路径，按 T 选。sequential 在 T 上是串行递推、时间线性
+        # 增长；chunked 把 T 切成 64 的块并行处理，时间几乎是平的。
+        #
+        # **但 kernel 级的交叉点和模型级的交叉点差一个数量级**，这一条值得记住：
+        #
+        #     T       kernel 级（单层 GDN）      模型级（整个 prefill）
+        #             seq      chunk            seq       chunk
+        #      512   0.702ms  0.224ms  3.1x    43.1ms   49.4ms  0.87x
+        #     1536      —        —              48.2ms   49.2ms  0.98x
+        #     2048   2.801ms  0.682ms  4.1x    66.9ms   47.7ms  1.40x
+        #     3072      —        —             106.0ms   48.3ms  2.20x
+        #
+        # 差异来自两处，都不在 kernel 里：
+        #   1. chunked 是三个 kernel，sequential 是一个。18 个 GDN 层就是 36 次
+        #      额外的 op 分发。
+        #   2. prefill 在 T < 2048 时是 CPU 分发受限的（约 43ms 地板，见 HANDOFF
+        #      8.13），GPU 那点差距根本露不出来，反倒是这 36 次分发被全额计入。
+        #
+        # 所以阈值按模型级的 2048 取，不是 kernel 级的 192。等 prefill 本身不再
+        # 卡在 CPU 上（进 CUDA Graph 或让它走 compile 路径），这个阈值应该下调。
+        if token_num >= GDN_CHUNKED_PREFILL_MIN_TOKENS:
+            core, state = call_gdn_recurrent_prefill_chunked_triton(q_n, k_n, v, beta, g)
+        else:
+            core, state = gdn_recurrent_prefill_sequential(q_n, k_n, v, beta, g)
 
         normed = gdn_gated_rmsnorm(core, z.view(token_num, heads, head_dim), w.norm)
         out = gemm_2d(normed.view(token_num, key_dim), w.out_proj)  # [T,1024]

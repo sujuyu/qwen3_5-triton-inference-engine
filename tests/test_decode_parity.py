@@ -167,6 +167,54 @@ def main() -> None:
         assert "超出 cache 容量" in str(exc)
         print("  超出 cache 容量时在 host 侧报错 ✓")
 
+    # ---- 6. GDN prefill 的两条路径：sequential vs chunk-64 ---------------
+    # 这一段是必要的，因为**上面所有测试都跑不到 chunked 路径**——oracle 的
+    # prompt 只有 19 个 token，远低于 GDN_CHUNKED_PREFILL_MIN_TOKENS，而
+    # chunked 与 sequential 在单个 chunk 内本来就等价，分辨不出任何东西。
+    #
+    # 判据用 **greedy token 序列**而不是 hidden 的相对误差。原因：两条路径在
+    # 24 层之后的 hidden 相对差约 2.8e-2，看着很大，但模型自身对 HF oracle 的
+    # 误差就有 1.8e-2——这个量级是 BF16 在 24 层上累积的噪声底，不是谁算错了。
+    # （实测原版 ieee 精度的 chunked 路径同样偏离 2.3e-2，所以这不是后来做
+    # tensor core 化引入的。）真正该问的是"输出会不会变"，答案是不会。
+    print("\n=== GDN prefill：sequential vs chunk-64 ===")
+    import engine.runner as runner_module
+
+    long_prompt = prompt.repeat((2048 + prompt_len - 1) // prompt_len)[:2048].contiguous()
+    long_caches = allocate_caches(runner.w, long_prompt.shape[0] + 80)
+    saved_threshold = runner_module.GDN_CHUNKED_PREFILL_MIN_TOKENS
+    try:
+        variants = {}
+        for name, threshold in (("sequential", 10**9), ("chunked", 0)):
+            runner_module.GDN_CHUNKED_PREFILL_MIN_TOKENS = threshold
+            long_caches.reset()
+            hidden = runner.prefill(long_prompt, long_caches)
+            states = [s.clone() for s in long_caches.recurrent_states if s is not None]
+            variants[name] = (hidden.clone(), states)
+            variants[name + "_tokens"] = runner.generate_cached(
+                long_prompt, max_new_tokens=64, stop_ids=None, caches=long_caches
+            )
+    finally:
+        runner_module.GDN_CHUNKED_PREFILL_MIN_TOKENS = saved_threshold
+
+    h_seq, s_seq = variants["sequential"]
+    h_chk, s_chk = variants["chunked"]
+    _, h_rel = rel(h_chk, h_seq)
+    s_rel = max(rel(a, b)[1] for a, b in zip(s_chk, s_seq))
+    print(f"  T={long_prompt.shape[0]}  hidden rel={h_rel:.2%}  recurrent state rel={s_rel:.2%}")
+    print(f"  （参考：整个模型对 HF oracle 的 hidden 误差就有 1.8%）")
+
+    tok_seq = variants["sequential_tokens"]
+    tok_chk = variants["chunked_tokens"]
+    if tok_seq == tok_chk:
+        print(f"  {len(tok_seq)} 个 greedy token 逐个相同 ✓")
+    else:
+        first = next(i for i, (a, b) in enumerate(zip(tok_seq, tok_chk)) if a != b)
+        raise AssertionError(
+            f"chunked 与 sequential 的 greedy 结果在第 {first} 个 token 分叉："
+            f"{tok_chk[first]} vs {tok_seq[first]}"
+        )
+
     print("\nAll decode parity tests passed.")
 
 
