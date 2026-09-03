@@ -29,7 +29,18 @@ from triton_kernels.depthwise_causal_conv4_prefill import depthwise_causal_conv4
 from triton_kernels.embedding_gather import embedding_gather
 from triton_kernels.gdn_gated_rmsnorm import gdn_gated_rmsnorm
 from triton_kernels.gdn_qk_norm_gates import gdn_qk_norm_gates
-from triton_kernels.gdn_recurrent_prefill import gdn_recurrent_prefill_sequential
+from triton_kernels.depthwise_causal_conv4_decode import (
+    conv_state_from_prefill,
+    depthwise_causal_conv4_decode,
+)
+from triton_kernels.gdn_recurrent_prefill import (
+    gdn_recurrent_decode,
+    gdn_recurrent_prefill_sequential,
+)
+from triton_kernels.gqa_attention_decode import (
+    call_gqa_attention_decode_split_triton,
+)
+from engine.cache import DecodeCaches, allocate_caches
 from triton_kernels.gemm_2d import gemm_2d
 from triton_kernels.gqa_attention_without_kvcache_casual import (
     gqa_attention_without_kvcache_casual,
@@ -100,7 +111,14 @@ class Qwen35Runner:
 
     # ---------------------------------------------------------------- mixers
 
-    def _gdn(self, h: torch.Tensor, w: GDNLayerWeights, trace: dict | None, tag: str):
+    def _gdn(
+        self,
+        h: torch.Tensor,
+        w: GDNLayerWeights,
+        trace: dict | None,
+        tag: str,
+        fill: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ):
         token_num = h.shape[0]
         heads = self.w.linear_num_heads
         head_dim = self.w.linear_head_dim
@@ -124,6 +142,13 @@ class Qwen35Runner:
 
         normed = gdn_gated_rmsnorm(core, z.view(token_num, heads, head_dim), w.norm)
         out = gemm_2d(normed.view(token_num, key_dim), w.out_proj)  # [T,1024]
+
+        if fill is not None:
+            conv_state, recurrent_state = fill
+            # conv state 取的是 conv 的**输入** qkv 的最后 4 行，不是 conv 输出。
+            # T < 4 时 conv_state_from_prefill 会在上方补零。
+            conv_state.copy_(conv_state_from_prefill(qkv))
+            recurrent_state.copy_(state)
 
         if trace is not None:
             trace[f"{tag}.in_proj_qkv"] = qkv
@@ -151,6 +176,7 @@ class Qwen35Runner:
         pos: torch.Tensor,
         trace: dict | None,
         tag: str,
+        fill: tuple[torch.Tensor, torch.Tensor] | None = None,
     ):
         token_num = h.shape[0]
         nh = self.w.num_attention_heads
@@ -182,6 +208,12 @@ class Qwen35Runner:
         packed = attention_gate_pack(ctx, gate4)  # [T,2048] 连续
         out = gemm_2d(packed, w.o_proj)  # [T,1024]
 
+        if fill is not None:
+            k_cache, v_cache = fill
+            # 存 RoPE **之后**的 K；v4 是 permute 出来的 view，copy_ 会处理 stride
+            k_cache[:, :token_num, :].copy_(k4[0])
+            v_cache[:, :token_num, :].copy_(v4[0])
+
         if trace is not None:
             trace[f"{tag}.q_proj_q"] = q_raw
             trace[f"{tag}.q_proj_gate"] = gate
@@ -195,6 +227,137 @@ class Qwen35Runner:
             trace[f"{tag}.packed"] = packed
             trace[f"{tag}.out_proj"] = out
         return out
+
+    # ------------------------------------------------------- decode 版 mixer
+    #
+    # 与 prefill 版逐行对应，只有三处不同：
+    #   1. T 恒为 1，所有 [T,...] 变成 [1,...]
+    #   2. conv 和 delta rule 换成 decode 版，从 cache 续算而不是从零重算
+    #   3. attention 从 KV cache 读历史，位置由显存里的 pos 决定
+    # 其余（投影、切分、norm、gate、o_proj）完全共用同一套 kernel 和布局约定。
+
+    def _gdn_decode(
+        self,
+        h: torch.Tensor,
+        w: GDNLayerWeights,
+        conv_state: torch.Tensor,
+        recurrent_state: torch.Tensor,
+    ):
+        heads = self.w.linear_num_heads
+        head_dim = self.w.linear_head_dim
+        key_dim = heads * head_dim
+
+        qkv = gemm_2d(h, w.in_proj_qkv)  # [1,6144]
+        z = gemm_2d(h, w.in_proj_z)
+        a = gemm_2d(h, w.in_proj_a)
+        b = gemm_2d(h, w.in_proj_b)
+
+        # conv_state 存的是 conv 的**输入**（in_proj_qkv 的输出），不是输出也不是
+        # SiLU 之后的值。这个 op 会就地推进 state。权重要用 [4,D] 那份。
+        conv = depthwise_causal_conv4_decode(qkv, conv_state, w.conv1d_decode)
+
+        q = conv[:, 0:key_dim].view(1, heads, head_dim)
+        k = conv[:, key_dim : 2 * key_dim].view(1, heads, head_dim)
+        v = conv[:, 2 * key_dim : 3 * key_dim].view(1, heads, head_dim)
+
+        q_n, k_n, beta, g = gdn_qk_norm_gates(q, k, a, b, w.a_log, w.dt_bias)
+        # 同样就地推进 [16,128,128] 的 FP32 状态
+        core = gdn_recurrent_decode(q_n, k_n, v, beta, g, recurrent_state)
+
+        normed = gdn_gated_rmsnorm(core, z.view(1, heads, head_dim), w.norm)
+        return gemm_2d(normed.view(1, key_dim), w.out_proj)
+
+    def _attention_decode(
+        self,
+        h: torch.Tensor,
+        w: AttnLayerWeights,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        pos: torch.Tensor,
+        scratch,
+    ):
+        nh, nkv, d = (
+            self.w.num_attention_heads,
+            self.w.num_key_value_heads,
+            self.w.head_dim,
+        )
+
+        q_raw = gemm_2d(h, w.q_proj_q)  # [1,2048]
+        gate = gemm_2d(h, w.q_proj_gate)
+        k_raw = gemm_2d(h, w.k_proj)  # [1,512]
+        v_raw = gemm_2d(h, w.v_proj)
+
+        q = qwen_rmsnorm(q_raw.view(1, nh, d), w.q_norm, self.eps)
+        k = qwen_rmsnorm(k_raw.view(1, nkv, d), w.k_norm, self.eps)
+
+        # RoPE 的 position 就是 pos 本身（新 token 的下标 = 已缓存的数量）。
+        # 传显存张量而不是 python int——CUDA Graph 下标量会被冻结。
+        pos_ids = pos.view(1, 1)
+        q4 = partial_rope(
+            q.unsqueeze(0).permute(0, 2, 1, 3), pos_ids, self.inv_freq, self.w.rotary_dim
+        )
+        k4 = partial_rope(
+            k.unsqueeze(0).permute(0, 2, 1, 3), pos_ids, self.inv_freq, self.w.rotary_dim
+        )
+
+        # 存进 cache 的必须是 RoPE **之后**的 K——历史 token 的 position 不会变，
+        # 每步重新旋转是错的。
+        ctx = call_gqa_attention_decode_split_triton(
+            q4[0, :, 0, :].contiguous(),
+            k4[0, :, 0, :].contiguous(),
+            v_raw.view(nkv, d).contiguous(),
+            k_cache,
+            v_cache,
+            pos,
+            scratch,
+        )  # [H_q, D]
+
+        # T=1 时 pack 退化成逐元素乘 + 重排，仍复用 prefill 那个 kernel
+        gate4 = gate.view(1, 1, nh, d).permute(0, 2, 1, 3)  # [1,H,1,D]
+        packed = attention_gate_pack(ctx.view(1, nh, 1, d), gate4)  # [1,2048]
+        return gemm_2d(packed, w.o_proj)
+
+    def decode_step(
+        self,
+        token_id: torch.Tensor,
+        caches: DecodeCaches,
+        trace: dict | None = None,
+    ) -> torch.Tensor:
+        """单 token 前向。token_id: [1] int32；返回 final norm 之后的 [1,1024]。
+
+        **不推进 pos**——推进放在调用方（或 CUDA Graph 末尾），因为 attention
+        需要"写入位置 = 当前 pos"，推进必须在整个 forward 之后。
+        """
+        x = embedding_gather(token_id, self.w.embed_tokens)  # [1,1024]
+
+        for i, layer in enumerate(self.w.layers):
+            residual = x
+            h = qwen_rmsnorm(x, layer.input_layernorm, self.eps)
+            if isinstance(layer, GDNLayerWeights):
+                h = self._gdn_decode(
+                    h, layer, caches.conv_states[i], caches.recurrent_states[i]
+                )
+            else:
+                h = self._attention_decode(
+                    h,
+                    layer,
+                    caches.k_caches[i],
+                    caches.v_caches[i],
+                    caches.pos,
+                    caches.split_scratch,
+                )
+            x = residual_add(h, residual)
+
+            residual = x
+            h = qwen_rmsnorm(x, layer.post_attention_layernorm, self.eps)
+            h = swiglu(gemm_2d(h, layer.mlp.gate_proj), gemm_2d(h, layer.mlp.up_proj))
+            h = gemm_2d(h, layer.mlp.down_proj)
+            x = residual_add(h, residual)
+
+            if trace is not None:
+                trace[f"layer{i:02d}.out"] = x
+
+        return qwen_rmsnorm(x, self.w.norm, self.eps)
 
     # ---------------------------------------------------------------- forward
 
@@ -231,6 +394,7 @@ class Qwen35Runner:
         pos: torch.Tensor,
         trace: dict | None,
         trace_layers: set[int] | None,
+        caches: DecodeCaches | None = None,
     ) -> torch.Tensor:
         if trace_layers is None:
             trace_layers = {0, 3}
@@ -249,9 +413,17 @@ class Qwen35Runner:
                 inner[f"{tag}.input_layernorm"] = h
 
             if isinstance(layer, GDNLayerWeights):
-                h = self._gdn(h, layer, inner, tag)
+                h = self._gdn(
+                    h, layer, inner, tag,
+                    fill=None if caches is None
+                    else (caches.conv_states[i], caches.recurrent_states[i]),
+                )
             else:
-                h = self._attention(h, layer, pos, inner, tag)
+                h = self._attention(
+                    h, layer, pos, inner, tag,
+                    fill=None if caches is None
+                    else (caches.k_caches[i], caches.v_caches[i]),
+                )
             x = residual_add(h, residual)
 
             residual = x
@@ -297,6 +469,67 @@ class Qwen35Runner:
             ids = torch.cat(
                 [ids, torch.tensor([token], dtype=torch.int32, device=self.device)]
             )
+        return generated
+
+
+    # -------------------------------------------------- prefill + decode 路径
+
+    def prefill(self, input_ids: torch.Tensor, caches: DecodeCaches) -> torch.Tensor:
+        """整段 prefill，顺带把三类 cache 填好。返回 final norm 后的 [T,1024]。
+
+        走的就是完整重算那条路径，只是每层多写一次 cache——所以 prefill 的数值
+        与 `forward()` 完全一致，不需要额外对拍。
+
+        **必须先 reset**：cache 里可能有上一轮的残留。
+        """
+        assert input_ids.ndim == 1
+        token_num = input_ids.shape[0]
+        assert token_num <= caches.max_len, (
+            f"prompt 长度 {token_num} 超出 cache 容量 {caches.max_len}"
+        )
+        pos = self._positions(token_num)
+        hidden = self._forward(input_ids, pos, None, None, caches=caches)
+        # 位置推进到"已缓存 token_num 个"，下一个 decode 写在下标 token_num
+        caches.pos.fill_(token_num)
+        return hidden
+
+    def generate_cached(
+        self,
+        input_ids: list[int] | torch.Tensor,
+        max_new_tokens: int = 32,
+        stop_ids: tuple[int, ...] | None = DEFAULT_STOP_IDS,
+        max_len: int | None = None,
+        caches: DecodeCaches | None = None,
+    ) -> list[int]:
+        """prefill 一次 + 逐 token 增量 decode。
+
+        与 `generate()`（每步对整个序列重算）的区别只在于用不用 cache；两者的
+        greedy 结果应当一致，`tests/test_decode_parity.py` 就是对拍这一点。
+        """
+        if not isinstance(input_ids, torch.Tensor):
+            input_ids = torch.tensor(input_ids, dtype=torch.int32, device=self.device)
+        ids = input_ids.to(torch.int32)
+        prompt_len = ids.shape[0]
+
+        if caches is None:
+            need = max_len or (prompt_len + max_new_tokens + 8)
+            caches = allocate_caches(self.w, need)
+        caches.reset()
+
+        hidden = self.prefill(ids, caches)
+        token = int(lm_head_argmax(hidden, self.w.embed_tokens).item())
+
+        generated = [token]
+        slot = torch.empty(1, dtype=torch.int32, device=self.device)
+        for _ in range(max_new_tokens - 1):
+            if stop_ids and token in stop_ids:
+                break
+            slot.fill_(token)
+            hidden = self.decode_step(slot, caches)
+            # pos 的推进放在 forward 之后：attention 需要"写入位置 = 当前 pos"
+            caches.pos.add_(1)
+            token = int(lm_head_argmax(hidden, self.w.embed_tokens).item())
+            generated.append(token)
         return generated
 
 
