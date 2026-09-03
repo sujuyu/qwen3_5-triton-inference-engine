@@ -133,6 +133,40 @@ def main() -> None:
     assert again == ref_tokens[:8], "reset 之后结果不可复现——cache 没清干净"
     print(f"  同一份 caches 复用，结果一致 ✓")
 
+    # ---- 5. CUDA Graph 化的 decode -------------------------------------
+    # 图内闭环（argmax 结果直接写回输入槽、pos 自增），host 每步只 replay。
+    print("\n=== CUDA Graph decode ===")
+    from engine.runner import GraphedDecoder
+
+    caches.reset()
+    runner.prefill(prompt, caches)
+    decoder = GraphedDecoder(runner, caches)
+    decoder.capture()  # 会把 cache 写脏，下面 generate_graphed 里会重新 prefill
+
+    graphed = runner.generate_graphed(
+        prompt, max_new_tokens=n_steps, stop_ids=None, decoder=decoder
+    )
+    print(f"  graph : {graphed[:10]} ...")
+    assert graphed == ref_tokens, "CUDA Graph 路径与完整重算不一致"
+    print(f"  {len(graphed)} 个 token 与完整重算逐个相同 ✓")
+
+    # 复用同一张图再跑一次，验证 reset 把状态清干净了
+    again = runner.generate_graphed(
+        prompt, max_new_tokens=n_steps, stop_ids=None, decoder=decoder
+    )
+    assert again == ref_tokens, "复用图后结果不可复现——cache 或 pos 没复位"
+    print("  复用同一张图，结果一致 ✓")
+
+    # 容量守卫：越界应该在 host 侧报清楚的错，而不是 device-side assert
+    try:
+        runner.generate_graphed(
+            prompt, max_new_tokens=caches.max_len, stop_ids=None, decoder=decoder
+        )
+        raise SystemExit("容量越界没有被拦住")
+    except AssertionError as exc:
+        assert "超出 cache 容量" in str(exc)
+        print("  超出 cache 容量时在 host 侧报错 ✓")
+
     print("\nAll decode parity tests passed.")
 
 

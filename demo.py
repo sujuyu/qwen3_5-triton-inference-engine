@@ -6,8 +6,12 @@
     python demo.py "写一首关于秋天的诗" --thinking
 全部计算走 triton_kernels/ 下手写的 15 个 kernel，不依赖 transformers。
 
-走增量 decode：prefill 一次把三类 cache 填好（conv state、recurrent state、
-KV cache），之后每步只算一个 token。遇到 EOS 提前停。
+走增量 decode + CUDA Graph：prefill 一次把三类 cache 填好（conv state、
+recurrent state、KV cache），然后把整个 decode step（24 层前向 + argmax +
+pos 自增）捕获成一张图，之后每步只 replay。遇到 EOS 提前停。
+
+实测 42.0 -> 4.4 ms/token（9.5x）。省掉的是 eager 下每步约 400 次 op 调用的
+torch.library 分发开销。`--no-graph` 可切回逐 op 的 eager decode 做对照。
 
 `--max-tokens` 同时是生成上限和 KV cache 的分配依据，默认 512。
 
@@ -30,7 +34,7 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
 from engine.cache import allocate_caches
-from engine.runner import DEFAULT_STOP_IDS, build_runner
+from engine.runner import DEFAULT_STOP_IDS, GraphedDecoder, build_runner
 from triton_kernels.vocab_argmax import lm_head_argmax
 
 MODEL_DIR = ROOT / "Qwen3.5-0.8B"
@@ -47,6 +51,9 @@ def main() -> None:
     parser.add_argument("prompt", nargs="?", default="李世民是谁？和朱棣有什么共同点？")
     parser.add_argument("--max-tokens", type=int, default=512)
     parser.add_argument("--thinking", action="store_true", help="保留 think 段")
+    parser.add_argument(
+        "--no-graph", action="store_true", help="关掉 CUDA Graph，逐 op eager 执行"
+    )
     args = parser.parse_args()
 
     tokenizer = Tokenizer.from_file(str(MODEL_DIR / "tokenizer.json"))
@@ -62,10 +69,19 @@ def main() -> None:
     # 反而要付一次编译成本，所以这里不开。真正的提速手段是 CUDA Graph。
     runner = build_runner(str(MODEL_DIR), compile=False)
     caches = allocate_caches(runner.w, len(prompt_ids) + args.max_tokens + 8)
+    prompt_t = torch.tensor(prompt_ids, dtype=torch.int32, device=runner.device)
+
+    decoder = None
+    if not args.no_graph:
+        # 捕获前先 prefill，让 warmup 跑在合法的 cache 状态上；捕获本身会把
+        # cache 写脏，所以下面还要再 prefill 一次。
+        caches.reset()
+        runner.prefill(prompt_t, caches)
+        decoder = GraphedDecoder(runner, caches)
+        decoder.capture()
+
     caches.reset()
-    hidden = runner.prefill(
-        torch.tensor(prompt_ids, dtype=torch.int32, device=runner.device), caches
-    )
+    hidden = runner.prefill(prompt_t, caches)
     first_token = int(lm_head_argmax(hidden, runner.w.embed_tokens).item())
     load_elapsed = time.time() - load_start
 
@@ -81,6 +97,8 @@ def main() -> None:
         step_start = time.time()
         if pending is not None:                       # prefill 已经出了第一个 token
             token, pending = pending, None
+        elif decoder is not None:
+            token = decoder.step(generated[-1])
         else:
             slot.fill_(generated[-1])
             hidden = runner.decode_step(slot, caches)
@@ -118,7 +136,9 @@ def main() -> None:
     stalls = [(i, t) for i, t in enumerate(step_times) if t > max(0.2, median * 20 / 1e3)]
 
     print("\n" + "-" * 72)
-    print(f"加载+prefill {load_elapsed:.1f}s | 生成 {n} tokens，总用时 {elapsed:.1f}s")
+    mode = "eager" if args.no_graph else "CUDA Graph"
+    print(f"[{mode}] 加载+prefill+捕获 {load_elapsed:.1f}s | "
+          f"生成 {n} tokens，总用时 {elapsed:.1f}s")
     print(f"稳态 {median:.1f} ms/token（中位数）")
     if stalls:
         total_stall = sum(t for _, t in stalls)

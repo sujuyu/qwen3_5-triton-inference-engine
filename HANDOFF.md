@@ -1156,6 +1156,36 @@ replay 就会写到别人的数据上或未映射的地址。
 （真实值 41ms，差 150 倍）。要干净的 eager 基线就开新进程，或用 `compile=False`
 构造独立的 runner。
 
+### 8.12 decode 接上 CUDA Graph：42.0 -> 4.4 ms/token
+
+按 8.8 把 decode kernel 的标量挪到显存之后，整个 decode step 就能捕获成一张图。
+`engine/runner.py` 的 `GraphedDecoder` 做的就是这件事：24 层前向 + argmax +
+`pos.add_(1)` 全在图里。
+
+```text
+eager 逐步                    42.04 ms/token
+graph replay                   4.41 ms/token    9.5x
+graph replay + 每步 .item()    4.24 ms/token    9.9x
+```
+
+关键是**图内闭环**：`tok_slot.copy_(tok_out)` 把本步 argmax 的结果直接写回输入槽，
+于是连续 replay 就自动逐 token 生成，host 每步只要 `graph.replay()`。位置也在图内
+自增。
+
+**一个预设被实测推翻了。** 原本担心每步 `.item()` 读回 token 判停止条件会打断
+CPU/GPU 流水，打算"批量 replay N 步再统一检查"（代价是最多多生成 N-1 个 token）。
+实测同步开销是 **0**（-0.16ms 在噪声内）——GPU 那 4.4ms 的工作足够长，同步完全被
+掩盖。所以不需要那个取舍，每步照常判停即可。
+
+**必须 reset。** capture 过程本身（warmup + 正式捕获，共 7 次 `one_step`）会把 pos
+推进、把三类 cache 写脏，所以 `capture()` 之后、每个新 prompt 之前都要重新
+`reset()` + `prefill()`。`generate_graphed()` 把这个约束封在里面了。
+
+**容量守卫放在 host 侧。** `prompt_len + max_new_tokens > cache.max_len` 时
+`index_copy_` 会在 device 上 assert，报错点离真正原因很远
+（"CUDA error: device-side assert triggered"）。所以在 host 侧提前 assert 并给出
+具体数字——这个坑我们踩过两次（一次在测 graph 内存池时，一次在这里）。
+
 ## 9. 剩余工作
 
 **正确性里程碑已达成**：13 个 kernel + loader + runner 打通，49 项逐算子对拍全部在容差内，oracle prompt 上端到端 greedy 32 个 token 与 Hugging Face 逐个相同（第 7 节）。注意 token 全对是 prompt 相关的，逐算子对拍才是稳定判据，见 7.3 末尾。

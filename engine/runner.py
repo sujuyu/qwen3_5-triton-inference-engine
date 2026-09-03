@@ -514,6 +514,10 @@ class Qwen35Runner:
         if caches is None:
             need = max_len or (prompt_len + max_new_tokens + 8)
             caches = allocate_caches(self.w, need)
+        assert prompt_len + max_new_tokens <= caches.max_len, (
+            f"prompt {prompt_len} + 生成 {max_new_tokens} 超出 cache 容量 "
+            f"{caches.max_len}"
+        )
         caches.reset()
 
         hidden = self.prefill(ids, caches)
@@ -531,6 +535,134 @@ class Qwen35Runner:
             token = int(lm_head_argmax(hidden, self.w.embed_tokens).item())
             generated.append(token)
         return generated
+
+    def generate_graphed(
+        self,
+        input_ids: list[int] | torch.Tensor,
+        max_new_tokens: int = 32,
+        stop_ids: tuple[int, ...] | None = DEFAULT_STOP_IDS,
+        max_len: int | None = None,
+        decoder: "GraphedDecoder | None" = None,
+    ) -> list[int]:
+        """prefill + CUDA Graph 化的增量 decode。结果与 generate_cached 一致。
+
+        decoder 传 None 时会当场分配 cache 并捕获一次图；反复调用应该复用同一个
+        GraphedDecoder，捕获只需一次（捕获本身要跑几次 warmup，不便宜）。
+        """
+        if not isinstance(input_ids, torch.Tensor):
+            input_ids = torch.tensor(input_ids, dtype=torch.int32, device=self.device)
+        ids = input_ids.to(torch.int32)
+
+        if decoder is None:
+            need = max_len or (ids.shape[0] + max_new_tokens + 8)
+            caches = allocate_caches(self.w, need)
+            decoder = GraphedDecoder(self, caches)
+            # 捕获前先 prefill，让 warmup 跑在合法的 cache 状态上
+            caches.reset()
+            self.prefill(ids, caches)
+            decoder.capture()
+
+        # host 侧提前拦住：越界的话 index_copy_ 会在 device 上 assert，
+        # 报错点离真正原因很远（"CUDA error: device-side assert triggered"），很难查。
+        need_len = ids.shape[0] + max_new_tokens
+        assert need_len <= decoder.caches.max_len, (
+            f"prompt {ids.shape[0]} + 生成 {max_new_tokens} = {need_len} "
+            f"超出 cache 容量 {decoder.caches.max_len}；"
+            f"重新分配一个更大的 GraphedDecoder，或减少 max_new_tokens"
+        )
+
+        # capture 或上一轮生成把 cache 写脏了，这里必须重新来过
+        decoder.caches.reset()
+        hidden = self.prefill(ids, decoder.caches)
+        token = int(lm_head_argmax(hidden, self.w.embed_tokens).item())
+
+        generated = [token]
+        for _ in range(max_new_tokens - 1):
+            if stop_ids and token in stop_ids:
+                break
+            token = decoder.step(token)
+            generated.append(token)
+        return generated
+
+
+
+class GraphedDecoder:
+    """把一整个 decode step 包进 CUDA Graph：24 层前向 + argmax + pos 自增。
+
+    为什么值得做
+    ------------
+    eager 下一步 decode 有约 400 次 op 调用，每次约 90us 的 torch.library 分发开销
+    （HANDOFF 8.1/8.2），GPU 实际工作只有几毫秒。实测：
+
+        eager 逐步                    42.04 ms/token
+        graph replay                   4.41 ms/token    9.5x
+        graph replay + 每步 .item()    4.24 ms/token    9.9x
+
+    **每步 .item() 的同步开销测下来是 0**（在噪声内）——GPU 那 4.4ms 的工作足够长，
+    同步完全被掩盖。所以不需要"批量 replay N 步再统一读回 token"那种取舍，
+    每步照常判停止条件即可。
+
+    图内闭环
+    --------
+    关键是 `tok_slot.copy_(tok_out)`：把本步 argmax 的结果直接写回输入槽。
+    于是连续 replay 就自动逐 token 生成，host 侧每步只需要 `graph.replay()`
+    加一次读回来判停止。位置也在图内 `pos.add_(1)` 自增，同样不用 host 介入。
+
+    有状态，所以必须 reset
+    ----------------------
+    capture 过程本身（warmup + 正式捕获）会执行若干次 one_step，把 pos 推进、
+    把三类 cache 写脏。所以 `capture()` 之后、每次新 prompt 之前都必须重新
+    prefill。本类把这个约束封进 `run()`，调用方不用记。
+
+    局限
+    ----
+    - autotune 选中的 config 冻结在 capture 那一刻。当前实测跨 bucket 的 config
+      差异只带来约 16% 的耗时跨度（HANDOFF 8.9），单张图够用；要更好就每个
+      seq_bucket 捕获一张并共享内存池。
+    - grid 也冻结，但本项目的 decode kernel grid 全部与 seq_len 无关，天然满足。
+    """
+
+    def __init__(self, runner: "Qwen35Runner", caches: DecodeCaches):
+        self.runner = runner
+        self.caches = caches
+        dev = runner.device
+        # 输入输出槽都在图外分配，地址固定；图只录它们的地址常量
+        self.tok_slot = torch.zeros(1, dtype=torch.int32, device=dev)
+        self.tok_out = torch.zeros((), dtype=torch.int64, device=dev)
+        self.graph: torch.cuda.CUDAGraph | None = None
+
+    def _one_step(self) -> None:
+        hidden = self.runner.decode_step(self.tok_slot, self.caches)
+        self.tok_out.copy_(lm_head_argmax(hidden, self.runner.w.embed_tokens))
+        # pos 必须在 forward 之后推进：attention 要"写入位置 = 当前 pos"
+        self.caches.pos.add_(1)
+        self.tok_slot.copy_(self.tok_out)  # 闭环：本步输出即下步输入
+
+    def capture(self, warmup: int = 3) -> None:
+        """捕获一次。之后 caches 处于脏状态，调用方必须重新 prefill。"""
+        for _ in range(warmup):
+            self._one_step()
+        torch.cuda.synchronize()
+        # capture 必须在 side stream 上预热，否则 CUDA 会拒绝
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            for _ in range(warmup):
+                self._one_step()
+        torch.cuda.current_stream().wait_stream(side)
+        torch.cuda.synchronize()
+
+        self.graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self.graph):
+            self._one_step()
+
+    def step(self, prev_token: int | None = None) -> int:
+        """replay 一步。prev_token 传 None 表示沿用图内闭环写回的值。"""
+        assert self.graph is not None, "先调用 capture()"
+        if prev_token is not None:
+            self.tok_slot.fill_(prev_token)
+        self.graph.replay()
+        return int(self.tok_out.item())
 
 
 def build_runner(
