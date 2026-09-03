@@ -11,8 +11,12 @@
    而 qwen_rmsnorm 要求 contiguous。拆开后两个输出都是连续的 [T,2048]，
    view(T,8,256) 也连续，现有 kernel 一行不用改。见 HANDOFF.md 第 4 节。
 
-2. `conv1d.weight [6144,1,4]` squeeze 成 [6144,4]，kernel 两种布局都收，
-   squeeze 后仍然连续。
+2. `conv1d.weight [6144,1,4]` 存两份：prefill 用 `[6144,4]`（squeeze 后仍连续），
+   decode 用 `[4,6144]` contiguous。后者是 `depthwise_causal_conv4_decode` 要的布局
+   ——decode 时一个线程负责一个 channel，`[4,D]` 下相邻线程地址连续、访存合并，
+   `[D,4]` 下相隔 4 个元素。必须是真正 contiguous 的转置结果，不能是 view，
+   否则内存布局没变、合并的好处全没了。多占 18 层 × 48 KiB = 0.86 MiB。
+   详见 HANDOFF 3.8b。
 
 A_log 和 linear_attn.norm.weight 在 checkpoint 里就是 FP32，这里断言而不是转换——
 如果哪天上游改成 BF16 存，静默 cast 会掩盖问题。
@@ -56,7 +60,8 @@ class GDNLayerWeights:
     in_proj_z: torch.Tensor  # [2048,1024] BF16
     in_proj_a: torch.Tensor  # [16,1024] BF16
     in_proj_b: torch.Tensor  # [16,1024] BF16
-    conv1d: torch.Tensor  # [6144,4] BF16，已 squeeze
+    conv1d: torch.Tensor  # [6144,4] BF16，prefill 用
+    conv1d_decode: torch.Tensor  # [4,6144] BF16 contiguous，decode 用
     a_log: torch.Tensor  # [16] FP32
     dt_bias: torch.Tensor  # [16] BF16
     norm: torch.Tensor  # [128] FP32，direct-weight gated RMSNorm
@@ -302,6 +307,9 @@ def load_text_weights(
                             dtype=bf16,
                         ),
                         conv1d=conv1d.squeeze(1).contiguous(),
+                        conv1d_decode=conv1d.squeeze(1)
+                        .transpose(0, 1)
+                        .contiguous(),  # [4,D]，必须 contiguous 不能是 view
                         a_log=src.get(
                             f"{p}linear_attn.A_log", shape=(lin_heads,), dtype=fp32
                         ),
@@ -424,7 +432,9 @@ if __name__ == "__main__":
     )
     gdn0 = weights.layers[0]
     print(
-        f"layer0 conv1d  {tuple(gdn0.conv1d.shape)} | "
+        f"layer0 conv1d  prefill{tuple(gdn0.conv1d.shape)} "
+        f"decode{tuple(gdn0.conv1d_decode.shape)}"
+        f"(contig={gdn0.conv1d_decode.is_contiguous()}) | "
         f"A_log {gdn0.a_log.dtype} | norm {gdn0.norm.dtype} | dt_bias {gdn0.dt_bias.dtype}"
     )
     print("\n全部断言通过。")
