@@ -1,7 +1,7 @@
 """Qwen3.5-0.8B 文本主干权重加载器。
 
 只加载 `model.language_model.*`，显式跳过 `model.visual.*` 和 `mtp.*`。
-张量名、形状和 dtype 已对照 model.safetensors.index.json 核实，见 HANDOFF.md 8.1。
+张量名、形状和 dtype 已对照 model.safetensors.index.json 核实。
 
 两处不是原样搬运的地方：
 
@@ -9,14 +9,14 @@
    checkpoint 里 Q 和 gate 是按 head 交错的（第 h 个 head 占 [h*512, h*512+512)，
    前 256 行是 Q、后 256 行是 gate）。不拆的话，运行时切出来的 Q 是 strided view，
    而 qwen_rmsnorm 要求 contiguous。拆开后两个输出都是连续的 [T,2048]，
-   view(T,8,256) 也连续，现有 kernel 一行不用改。见 HANDOFF.md 第 4 节。
+   view(T,8,256) 也连续，现有 kernel 一行不用改。
 
 2. `conv1d.weight [6144,1,4]` 存两份：prefill 用 `[6144,4]`（squeeze 后仍连续），
    decode 用 `[4,6144]` contiguous。后者是 `depthwise_causal_conv4_decode` 要的布局
    ——decode 时一个线程负责一个 channel，`[4,D]` 下相邻线程地址连续、访存合并，
    `[D,4]` 下相隔 4 个元素。必须是真正 contiguous 的转置结果，不能是 view，
    否则内存布局没变、合并的好处全没了。多占 18 层 × 48 KiB = 0.86 MiB。
-   详见 HANDOFF 3.8b。
+   详见 `triton_kernels/depthwise_causal_conv4_decode.py`。
 
 A_log 和 linear_attn.norm.weight 在 checkpoint 里就是 FP32，这里断言而不是转换——
 如果哪天上游改成 BF16 存，静默 cast 会掩盖问题。

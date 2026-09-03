@@ -5,7 +5,7 @@
 
     python tests/test_oracle_parity.py
 
-参考实现有四处在 BF16 下计算而我们全程 FP32（见 HANDOFF.md 6.3），所以这里按
+参考实现有四处在 BF16 下计算而我们全程 FP32，所以这里按
 容差比而不是 bit-match。判定标准分两层：
 
 - 逐层 hidden 的相对误差不随层数发散；
@@ -84,7 +84,7 @@ def main() -> None:
     o_attn = torch.load(ORACLE / "layer03_attn.pt")
 
     # 严格对拍必须走 eager：compiled 与 eager 相对差约 1.1%（BF16 量级），
-    # 足以在近似平局处翻转 argmax。见 HANDOFF.md 第 8 节。
+    # 足以在近似平局处翻转 argmax。
     runner = build_runner(compile=False)
     input_ids = meta["input_ids"].to(torch.int32).cuda()
     token_num = int(meta["seq_len"])

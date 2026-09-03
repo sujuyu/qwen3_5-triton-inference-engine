@@ -20,3 +20,9 @@ venv/
 
 # 编辑器
 .vscode/
+
+# 内部开发文档：只在本地保留，不随仓库发布
+# HANDOFF.md      逐节的设计推导、性能实测与踩坑记录
+# NOTES-research.md  最初的 checkpoint 结构调研（旧 README）
+HANDOFF.md
+NOTES-research.md

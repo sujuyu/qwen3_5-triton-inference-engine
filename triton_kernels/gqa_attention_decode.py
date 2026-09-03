@@ -333,7 +333,7 @@ def call_gqa_attention_decode_triton(
 #
 # CUDA Graph 干的事很简单：把一串 kernel launch 连同它们的参数录下来，之后一次
 # replay 就把整串重放一遍。省掉的是 CPU 侧逐次 launch 的开销——而我们实测那部分
-# 占了 eager 下 forward 时间的 92%（HANDOFF 8.1），所以对 decode 这种"每步都是
+# 占了 eager 下 forward 时间的 92%，所以对 decode 这种"每步都是
 # 一堆小 kernel"的场景，它几乎是唯一的解法。
 #
 # 但"把参数一起录下来"这句话有代价，而且代价正好落在 decode 最需要变的东西上。
@@ -581,7 +581,7 @@ def _torch_reference(
 # ----------------------------------
 # 更多 split 没有收益——CTA 数过了 ~432 带宽就饱和了（见模块 docstring 的实测表），
 # 所以 split 数天然有上界。固定成常数还有个更强的理由：**cudagraph 要求 grid 在
-# capture 时固定**，而 cudagraph 是把 CPU 开销归零的唯一途径（HANDOFF 8.3）。
+# capture 时固定**，而 cudagraph 是把 CPU 开销归零的唯一途径。
 # num_splits 随 seq_len 变的话每步都要重新 capture，等于白做。
 #
 # 于是 scratch buffer 也是定长的，不随 token 数增长：

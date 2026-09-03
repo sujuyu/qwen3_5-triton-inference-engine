@@ -1,8 +1,12 @@
 """Qwen3.5-0.8B 24 层文本前向，全部用本仓库的 Triton kernel。
 
-当前策略是**完整重算**：每生成一个 token，就对增长后的整个序列重跑一次 forward。
-GDN 的 recurrent state 在单次 forward 内从零开始按 token 顺序推进，forward 之间不保留。
-KV cache、conv state cache 和增量 decode 等 kernel 齐了之后再切（见 HANDOFF.md 第 9 节）。
+三条生成路径：
+
+    generate()          不带 cache：每生成一个 token 就对增长后的整个序列重跑一次
+                        forward，每 token O(T)、总共 O(T^2)。只用作对拍基准。
+    generate_cached()   prefill 一次填好三类 cache，之后逐 token 增量 decode。
+    generate_graphed()  同上，且把整个 decode step 捕获成一张 CUDA Graph。
+                        demo 默认走这条，实测 42.0 -> 4.4 ms/token。
 
 布局要点（踩过的坑都在这）：
 
@@ -65,7 +69,7 @@ GDN_CHUNKED_PREFILL_MIN_TOKENS = 2048
 class Qwen35Runner:
     """完整重算前向。默认开 torch.compile。
 
-    compile 的收益和代价（A100 实测，详见 HANDOFF.md 第 8 节）：
+    compile 的收益和代价（A100 实测）：
 
     - eager 41.3 ms/forward，compile 后 6.4 ms，约 6.5x。eager 下 92% 的时间是
       torch.library 的分发开销，跟 T 几乎无关（T=19 到 257 都是 41-45ms）。
@@ -159,8 +163,9 @@ class Qwen35Runner:
         # 差异来自两处，都不在 kernel 里：
         #   1. chunked 是三个 kernel，sequential 是一个。18 个 GDN 层就是 36 次
         #      额外的 op 分发。
-        #   2. prefill 在 T < 2048 时是 CPU 分发受限的（约 43ms 地板，见 HANDOFF
-        #      8.13），GPU 那点差距根本露不出来，反倒是这 36 次分发被全额计入。
+        #   2. prefill 在 T < 2048 时是 CPU 分发受限的（短 prompt 约 43ms 是个
+        #      地板，与序列长度几乎无关），GPU 那点差距根本露不出来，反倒是这
+        #      36 次分发被全额计入。
         #
         # 所以阈值按模型级的 2048 取，不是 kernel 级的 192。等 prefill 本身不再
         # 卡在 CPU 上（进 CUDA Graph 或让它走 compile 路径），这个阈值应该下调。
@@ -621,7 +626,7 @@ class GraphedDecoder:
     为什么值得做
     ------------
     eager 下一步 decode 有约 400 次 op 调用，每次约 90us 的 torch.library 分发开销
-    （HANDOFF 8.1/8.2），GPU 实际工作只有几毫秒。实测：
+    GPU 实际工作只有几毫秒。实测：
 
         eager 逐步                    42.04 ms/token
         graph replay                   4.41 ms/token    9.5x
@@ -645,9 +650,12 @@ class GraphedDecoder:
 
     局限
     ----
-    - autotune 选中的 config 冻结在 capture 那一刻。当前实测跨 bucket 的 config
-      差异只带来约 16% 的耗时跨度（HANDOFF 8.9），单张图够用；要更好就每个
-      seq_bucket 捕获一张并共享内存池。
+    - autotune 选中的 config 冻结在 capture 那一刻。实测代价很小：固定 seq_len、
+      只改"冻结了哪个 config"时差异是 2.7%（短 prompt 下捕获、seq=4095 时 replay：
+      15.72 -> 16.15us），而 attention decode 只占一步的 2.2%。所以单张图够用；
+      要更好就每个 seq_bucket 捕获一张并共享内存池。
+      别拿"不同 seq_len 之间的耗时跨度"当这个代价——那里面大部分是序列变长
+      本身的成本，多少张图都省不掉。
     - grid 也冻结，但本项目的 decode kernel grid 全部与 seq_len 无关，天然满足。
     """
 

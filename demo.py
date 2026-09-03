@@ -148,7 +148,7 @@ def main() -> None:
         )
         for i, t in stalls[:8]:
             print(f"    step {i:>3}  {t:6.1f}s")
-        print("  详见 HANDOFF.md 8.3；减少这类停顿是当前性能工作的第一项。")
+        print("  这是一次性的：Triton 的编译与 autotune 结果会缓存到磁盘。")
 
 
 if __name__ == "__main__":

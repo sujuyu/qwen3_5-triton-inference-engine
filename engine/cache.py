@@ -19,8 +19,8 @@ attention 的 seq_len 来源。conv state 和 recurrent state 是"就地推进"�
 不需要知道自己在第几步，所以不用位置。
 
 **为什么位置放显存**：CUDA Graph capture 会把标量参数和切片下标烧进 launch 配置，
-replay 永远用 capture 那一刻的值。详见 HANDOFF 8.8 和
-`triton_kernels/gqa_attention_decode.py` 顶部那段长注释。
+replay 永远用 capture 那一刻的值。详见 `triton_kernels/gqa_attention_decode.py`
+顶部那段长注释。
 
 **reset() 不是可选的**。图是有状态的：capture 过程本身（warmup + 正式捕获）会把
 pos 推进好几格、也会污染 cache；换 prompt 时更是必须清空。所以这里把复位做成显式
