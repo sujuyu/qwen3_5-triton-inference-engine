@@ -217,14 +217,15 @@ python -m venv .venv-oracle
 
 ## 关于代码归属
 
-绝大部分 kernel 由仓库作者手写。其中 Gated DeltaNet 的 chunk-64 三段式并行 prefill
-（`gdn_chunk_*`）最初由 AI 助手生成，后续的性能改造（tensor core 化、分块修正，
-56x）由 Claude 完成，算法本身未动。数值对拍时以作者手写的 sequential 递推版本
-为基准。
+绝大部分 kernel 由仓库作者手写。例外是 Gated DeltaNet 的 chunk-64 三段式并行
+prefill（`gdn_chunk_*`）：它最初由 Codex 生成，后来由 Claude 做了性能改造
+（把绕开 tensor core 的 `input_precision="ieee"` 按操作数 dtype 逐个改掉，
+并修正 `chunk_output` 里导致 attention 矩阵被 8 个 CTA 重复计算的 blocking，
+合计 56x），算法本身未动。数值对拍时以作者手写的 sequential 递推版本为基准。
 
 ## 许可
 
+代码采用 [MIT 许可](LICENSE)。
+
 模型权重遵循 Qwen3.5-0.8B 自身的 Apache-2.0 许可，
 见 [官方仓库](https://huggingface.co/Qwen/Qwen3.5-0.8B)。
-
-本仓库代码的许可尚未确定（还没有 LICENSE 文件）。
