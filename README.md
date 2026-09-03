@@ -1,31 +1,44 @@
 # Qwen3.5-0.8B Triton 推理引擎
 
-用手写的 Triton kernel 把 Qwen3.5-0.8B 端到端跑起来。**推理路径上不依赖 transformers、
-vLLM、FlashAttention，也不调用 cuBLAS/cuDNN**——从 embedding 查表到 LM head 的
-argmax，24 层里的每一次计算都发生在这个仓库里的 Triton kernel 中。
+随着 kernel agent 发展得如日中天，我预感以后手写 kernel 的机会不会太多了。最近
+比较有空，就想用纯手写 Triton kernel 的方式把 Qwen3.5-0.8B 跑起来，借此加深对
+GPU 的理解，也对 LLM 有个初步的了解。
+
+用手写的 Triton kernel 把 Qwen3.5-0.8B 端到端跑起来。**推理路径上不依赖
+transformers、vLLM、FlashAttention，也不调用 cuBLAS/cuDNN**，从 embedding 查表到
+LM head 的 argmax，24 层里的每一次计算都发生在这个仓库的 Triton kernel 中。
 
 PyTorch 只用来做四件事：分配显存、变换形状（`view`/`contiguous`）、拷贝
-（`copy_`/`index_copy_`），以及调用 CUDA Graph 的 API。没有一个 `torch.matmul`、
-`F.softmax` 或 `F.linear` 出现在前向路径上。
+（`copy_`/`index_copy_`），以及调用 CUDA Graph 的 API。前向路径上没有一个
+`torch.matmul`、`F.softmax` 或 `F.linear`。
 
-这是一个学习项目：目的是搞清楚一个真实的、非标准结构的 LLM 从权重到 token 的
-每一步到底在算什么，以及在 GPU 上把它跑快需要面对哪些具体问题。
+仓库里的 kernel 基本都是我自己手写的。runner、loader、缓存管理这些衔接部分，还有
+测试和文档，则是让 Codex 和 Claude Code 协助完成的。唯一的例外是 GDN 的 chunk-64
+并行 prefill，那部分的 kernel 本身也经过了它们的协助改进，细节见文末「代码归属」。
+
+写这个 demo 的过程中，有些原本只是听说过的事情逐渐变得具体了。比如 eager 模式下
+九成时间花在算子分发而不是算力上；比如 CUDA Graph 会把标量参数烧进 launch 配置，
+所以序列位置必须搬到显存里去；比如 decode 阶段一个 kernel 只起两个 CTA 时，GPU 上
+一百多个 SM 大部分是闲着的，得靠 split-K 把并行度补回来；再比如同一个 `BLOCK_V`，
+在两个 kernel 里的最优值可以是相反的。
+
+目前只支持单个请求的推理，还在慢慢迭代。
 
 [English README](README-EN.md)
 
-## 为什么是这个模型
+## 为什么挑这个模型
 
-Qwen3.5-0.8B 的文本主干不是常见的「24 层全注意力」，而是按
+Qwen3.5-0.8B 的文本主干不是常见的 24 层全注意力，而是按
 `3 个 Gated DeltaNet + 1 个全注意力` 重复 6 次：
 
-- **18 层 Gated DeltaNet**（线性注意力）——每层含一个 kernel=4 的 depthwise causal
-  Conv1D 和一个 delta rule 递推，状态是 `[16, 128, 128]` 的矩阵而不是 KV 序列；
-- **6 层 GQA 全注意力**（层号 3/7/11/15/19/23）——8 个 Q head / 2 个 KV head，
-  head_dim 256，**RoPE 只作用在前 64 维**（partial rotary）；
+- **18 层 Gated DeltaNet**（线性注意力）。每层带一个 kernel=4 的 depthwise causal
+  Conv1D 和一个 delta rule 递推，状态是 `[16, 128, 128]` 的矩阵，不是 KV 序列。
+- **6 层 GQA 全注意力**（层号 3/7/11/15/19/23）。8 个 Q head、2 个 KV head，
+  head_dim 256，**RoPE 只作用在前 64 维**（partial rotary）。
 - 每层一个 1024 → 3584 → 1024 的 SwiGLU MLP。
 
-两种层的缓存机制完全不同，这正是有意思的地方：GDN 的状态是定长的（与上下文长度
-无关），全注意力的 KV cache 随长度线性增长。一个引擎里要同时管三类缓存。
+有意思的地方在于两种层的缓存机制完全不同。GDN 的状态是定长的，和上下文多长没关系；
+全注意力的 KV cache 则随长度线性增长。一个引擎里要同时管好三类缓存。
 
 文本主干 752,393,024 个参数，BF16 下 1.401 GiB。
 
@@ -51,23 +64,23 @@ prompt 23 tokens，最多生成 512 tokens
 1. **统一全国**：他通过一系列军事行动，成功平定了叛乱，统一了……
 ```
 
-## 快速开始
+## 怎么跑
 
 ### 1. 环境要求
 
-- **NVIDIA GPU，计算能力 8.0 及以上**（Ampere/Hopper）。开发和测试都在 A100 上做的；
-  kernel 里的一些精度选择（`tf32x3`、BF16 tensor core）是按 sm80 调的，
-  在更老的卡上跑不了，在更新的卡上能跑但未必最优。
-- 显存 ≥ 6 GiB（权重 1.4 GiB + 缓存 + 中间量）。
-- Linux。Windows 未测试。
+- **NVIDIA GPU，计算能力 8.0 以上**（Ampere/Hopper）。开发和测试都在 A100 上做。
+  kernel 里有些精度上的取舍（`tf32x3`、BF16 tensor core）是按 sm80 调的，更老的卡
+  跑不了，更新的卡能跑但未必最优。
+- 显存 6 GiB 以上（权重 1.4 GiB，加上缓存和中间量）。
+- Linux。Windows 没试过。
 
-### 2. 装依赖
+### 2. 安装依赖
 
 ```bash
 pip install torch triton safetensors tokenizers
 ```
 
-开发时使用的版本（其他相近版本应该也可以）：
+我用的版本，相近版本应该都行：
 
 | 包 | 版本 |
 |---|---|
@@ -78,24 +91,24 @@ pip install torch triton safetensors tokenizers
 | tokenizers | 0.22.2 |
 | CUDA | 12.8 |
 
-注意 **`transformers` 不是运行依赖**。它只在生成数值对拍基准时需要，见
-「正确性验证」一节。
+注意 **`transformers` 不是运行依赖**，它只在生成数值对拍基准时才需要，见
+「怎么验证正确性」一节。
 
 ### 3. 下载权重
 
-从 Hugging Face 取 [`Qwen/Qwen3.5-0.8B`](https://huggingface.co/Qwen/Qwen3.5-0.8B)，
-放在仓库根目录下名为 `Qwen3.5-0.8B/` 的文件夹里：
+从 Hugging Face 拉 [`Qwen/Qwen3.5-0.8B`](https://huggingface.co/Qwen/Qwen3.5-0.8B)，
+放到仓库根目录的 `Qwen3.5-0.8B/` 下：
 
 ```bash
 pip install huggingface_hub
 huggingface-cli download Qwen/Qwen3.5-0.8B --local-dir Qwen3.5-0.8B
 ```
 
-开发时锁定的 revision 是 `2fc06364715b967f1860aea9cf38778875588b17`。
-loader 会断言参数量、层数分布和每个张量的形状与 dtype，checkpoint 一旦变了会直接
-报错而不是静默出错。
+我锁的 revision 是 `2fc06364715b967f1860aea9cf38778875588b17`。loader 会逐项断言
+参数量、层数分布，以及每个张量的形状和 dtype，checkpoint 变了会当场报错，不会
+静默算错。
 
-目录里需要这些文件（其余的用不到）：
+用得上的只有这几个文件：
 
 ```
 Qwen3.5-0.8B/
@@ -105,7 +118,7 @@ Qwen3.5-0.8B/
 └── tokenizer.json
 ```
 
-### 4. 跑起来
+### 4. 运行
 
 ```bash
 python demo.py "用一句话解释什么是注意力机制"
@@ -115,33 +128,33 @@ python demo.py "用一句话解释什么是注意力机制"
 
 | 参数 | 说明 |
 |---|---|
-| `--max-tokens N` | 生成上限，同时决定 KV cache 分配多大。默认 512 |
-| `--thinking` | 保留模型的 think 段（默认跳过） |
+| `--max-tokens N` | 生成上限，同时决定给 KV cache 分配多少空间。默认 512 |
+| `--thinking` | 保留模型的 think 段，默认跳过 |
 | `--no-graph` | 关掉 CUDA Graph，走逐 op 的 eager 路径做对照 |
 
-**第一次运行会慢**（几十秒到一分钟），因为 Triton 要 JIT 编译并 autotune 所有
-kernel。结果会缓存到 `~/.triton/cache`，之后启动时间就只剩加载 1.4 GiB 权重本身
-（约 2 秒）。这个磁盘缓存由 `triton_kernels/__init__.py` 自动开启。
+**第一次跑会比较慢**，几十秒到一分钟，因为 Triton 要 JIT 编译并 autotune 所有
+kernel。结果会缓存到 `~/.triton/cache`，之后启动就只剩加载 1.4 GiB 权重的时间，
+两秒左右。这个磁盘缓存由 `triton_kernels/__init__.py` 自动打开。
 
-## 项目结构
+## 代码结构
 
 ```
 triton_kernels/     15 个文件，21 个通过 torch.library 注册的算子
 engine/
-  loader.py         safetensors 权重加载 + 布局重排（见下）
-  cache.py          三类缓存的分配与生命周期
+  loader.py         safetensors 权重加载，以及两处布局重排
+  cache.py          三类缓存的分配和生命周期
   runner.py         24 层前向、prefill/decode 两条路径、CUDA Graph 封装
 demo.py             命令行对话入口
 tests/              数值对拍
-tools/dump_oracle.py  生成参考张量（需要独立环境）
+tools/dump_oracle.py  生成参考张量，需要独立环境
 ```
 
-`loader.py` 做了两处不是原样搬运的事，都是为了让下游 kernel 能拿到连续内存：
+`loader.py` 里有两个地方没有照搬 checkpoint，都是为了让下游 kernel 拿到连续内存：
 
-1. `q_proj [4096,1024]` 拆成 Q 和 gate 各 `[2048,1024]`——checkpoint 里两者按 head
-   交错存放，不拆的话切出来的 Q 是 strided view；
-2. `conv1d` 存两份，prefill 用 `[6144,4]`、decode 用 `[4,6144]`——decode 时一个线程
-   负责一个 channel，`[4,D]` 布局下相邻线程的地址连续，访存能合并。
+1. 把 `q_proj [4096,1024]` 拆成 Q 和 gate 各 `[2048,1024]`。checkpoint 里两者按
+   head 交错存放，不拆的话运行时切出来的 Q 是 strided view。
+2. `conv1d` 存两份，prefill 用 `[6144,4]`，decode 用 `[4,6144]`。decode 时一个线程
+   管一个 channel，`[4,D]` 布局下相邻线程读的地址是挨着的，访存能合并。
 
 ### 算子清单
 
@@ -162,19 +175,19 @@ tools/dump_oracle.py  生成参考张量（需要独立环境）
 
 </details>
 
-## 正确性验证
+## 怎么验证正确性
 
 三层判据，从局部到整体：
 
 ```bash
-python tests/test_gemm_model_shapes.py   # GEMM 在模型真实尺寸下的正确性与效率
+python tests/test_gemm_model_shapes.py   # GEMM 在模型真实尺寸下的正确性和效率
 python tests/test_oracle_parity.py       # 49 项逐算子对拍 Hugging Face
 python tests/test_decode_parity.py       # 增量 decode vs 完整重算 vs CUDA Graph
 python triton_kernels/gdn_recurrent_prefill.py   # kernel 自带的单元测试
 ```
 
-**后两个需要先生成参考张量**，而这一步（也只有这一步）需要 `transformers`。
-参考张量约 13 MB，没有提交进仓库：
+**后两个要先生成参考张量**，只有这一步需要 `transformers`。参考张量 13 MB 左右，
+没有提交进仓库：
 
 ```bash
 python -m venv .venv-oracle
@@ -182,50 +195,51 @@ python -m venv .venv-oracle
 .venv-oracle/bin/python tools/dump_oracle.py
 ```
 
-脚本会把 HF 参考实现每一层、每个子模块的输入输出存进 `oracle/`。之后主环境不需要
-再装 transformers。
+脚本会把 HF 参考实现每一层、每个子模块的输入输出存进 `oracle/`。存完之后主环境就
+不用再装 transformers 了。
 
-逐算子对拍才是稳定判据——「生成的 token 和 HF 完全一样」是 prompt 相关的，
-在 top-1 和 top-2 极接近时 BF16 的舍入差异就足以翻转 argmax。
+真正稳定的判据是逐算子对拍。「生成的 token 和 HF 完全一样」这种说法换个 prompt 就
+可能不成立，因为 top-1 和 top-2 接近时，BF16 的舍入差异就足以把 argmax 翻过去。
 
-## 局限性
+## 局限
 
-这是一个学习项目，**不是能用于生产的推理服务**。已知的边界：
+这是我拿来学习的项目，**不能当生产用的推理服务**。已知的边界：
 
 **功能上**
 
-- **只支持单个请求。** batch 恒为 1，没有 padding、没有 continuous batching、
-  没有请求队列。
-- **没有连续对话能力。** 每次运行处理一轮独立的问答，不保留历史、不复用上一轮的
-  KV cache。要多轮对话得自己把历史拼进 prompt 重新 prefill。
-- **只有 greedy 采样。** 没有 temperature/top-k/top-p。这不是漏掉了，而是
-  `lm_head_argmax` 刻意把 LM head 的 GEMV 和 argmax 融进了一个 kernel，
-  248320 维的 logits 从来不物化——省掉了 1 MB 的写和读。要加采样得改这个 kernel
-  的输出形式。
-- **只做文本。** checkpoint 里的视觉塔（`model.visual.*`）和 MTP（`mtp.*`）
-  完全不加载。这个模型本身是多模态的，图像输入这里不支持。
-- **只有 BF16。** 没有量化（INT8/FP8/GPTQ/AWQ）。
-- 上下文长度受启动时预分配的缓存限制（由 `--max-tokens` 决定），中途不会扩容。
+- **只支持单个请求。** batch 恒为 1，没有 padding，没有 continuous batching，
+  也没有请求队列。
+- **没有连续对话。** 每次运行只处理一轮独立问答，不保留历史，也不复用上一轮的
+  KV cache。要多轮的话得自己把历史拼进 prompt 重新 prefill。
+- **只有 greedy。** 没有 temperature/top-k/top-p。这不是忘了做：`lm_head_argmax`
+  刻意把 LM head 的 GEMV 和 argmax 融进了一个 kernel，248320 维的 logits 从头到尾
+  不物化，省掉 1 MB 的一写一读。要加采样得先改这个 kernel 的输出形式。
+- **只做文本。** checkpoint 里的视觉塔（`model.visual.*`）和 MTP（`mtp.*`）完全不
+  加载。模型本身是多模态的，但这里不支持图像输入。
+- **只有 BF16。** 没做量化（INT8/FP8/GPTQ/AWQ）。
+- 上下文长度受启动时预分配的缓存限制，由 `--max-tokens` 决定，中途不会扩容。
 
 **工程上**
 
-- **只在 A100（sm80）上验证过。** 需要 sm80 及以上。
-- 没有服务化：只有一个命令行 demo，没有 HTTP API、没有 OpenAI 兼容接口。
-- prefill 目前受 CPU 侧的算子分发开销限制（短 prompt 约 43ms 是个地板，与序列长度
-  几乎无关），只有 decode 走了 CUDA Graph。
-- 数值对拍的 oracle 只覆盖一个 19 token 的中文 prompt，长序列和英文的覆盖还不够。
+- **只在 A100（sm80）上验证过**，需要 sm80 以上。
+- 没有服务化，只有一个命令行 demo，没有 HTTP API，也没有 OpenAI 兼容接口。
+- prefill 还卡在 CPU 侧的算子分发上，短 prompt 大约 43ms 是个地板，和序列长度几乎
+  无关。目前只有 decode 走了 CUDA Graph。
+- 数值对拍的 oracle 只有一个 19 token 的中文 prompt，长序列和英文都还没覆盖到。
 
-## 关于代码归属
+## 代码归属
 
-绝大部分 kernel 由仓库作者手写。例外是 Gated DeltaNet 的 chunk-64 三段式并行
-prefill（`gdn_chunk_*`）：它最初由 Codex 生成，后来由 Claude 做了性能改造
-（把绕开 tensor core 的 `input_precision="ieee"` 按操作数 dtype 逐个改掉，
-并修正 `chunk_output` 里导致 attention 矩阵被 8 个 CTA 重复计算的 blocking，
-合计 56x），算法本身未动。数值对拍时以作者手写的 sequential 递推版本为基准。
+开头提到的那个例外，具体是 Gated DeltaNet 的 chunk-64 三段式并行 prefill
+（`gdn_chunk_*`）。它最初由 Codex 生成，后来 Claude 做了性能改造：把绕开 tensor
+core 的 `input_precision="ieee"` 按操作数 dtype 逐个改掉，又修正了 `chunk_output`
+里让 8 个 CTA 重复计算同一份 attention 矩阵的 blocking，合计快了 56 倍，算法本身
+没动。
+
+这条路径上的数值对拍，以我手写的 sequential 递推版本为基准。
 
 ## 许可
 
 代码采用 [MIT 许可](LICENSE)。
 
-模型权重遵循 Qwen3.5-0.8B 自身的 Apache-2.0 许可，
-见 [官方仓库](https://huggingface.co/Qwen/Qwen3.5-0.8B)。
+模型权重遵循 Qwen3.5-0.8B 自己的 Apache-2.0 许可，见
+[官方仓库](https://huggingface.co/Qwen/Qwen3.5-0.8B)。
