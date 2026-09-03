@@ -993,7 +993,57 @@ autotune 的 key 只能是 host 侧标量，所以三个 op 都额外收一个 `
 都不含随步变化的标量，不用动。`gqa_attention_decode.py` 的第 5 段测试做了完整验证：
 捕获 1 次、replay 32 次、`pos` 自动 8 -> 40，结果与整段 causal prefill 一致。
 
-### 8.9 一个测量陷阱
+### 8.9 每个 bucket 一张图，以及为什么必须共享内存池
+
+8.8 解决了标量和 grid 的冻结，但还剩一个：**config 也会被冻结**。
+
+autotune 的 key 只能是 host 侧标量，所以三个 decode op 都额外收一个
+`seq_bucket: int`。它不参与任何计算，只决定选哪个 config——但 config 里的
+`BLOCK_T` 会随 bucket 变，capture 之后就固定了：
+
+```text
+seq_len=  64  BLOCK_T=16 warps=4 stages=2   12.53us
+seq_len= 256  BLOCK_T=16 warps=4 stages=2   13.37us
+seq_len=1024  BLOCK_T=16 warps=4 stages=1   13.43us
+seq_len=4095  BLOCK_T=32 warps=4 stages=2   14.51us
+```
+
+拿短序列调出的 config 跑长序列只是慢一点、不会算错（correctness 全部由显存里的
+`pos` 决定）。当前跨度不大——12.5 → 14.5μs，而且大部分是序列变长本身带来的，
+不是 config 选差了——所以单张图够用。
+
+要做得更好，方向是**每个 bucket 捕获一张图**，按 host 已知的 seq_len 选：
+
+```python
+graphs, pool = {}, None
+for b in (64, 256, 1024, 4096):
+    pos.fill_(b - 1); warmup()
+    g = torch.cuda.CUDAGraph()
+    with (torch.cuda.graph(g, pool=pool) if pool else torch.cuda.graph(g)):
+        one_decode_step()
+    pool = pool or g.pool()
+    graphs[b] = g
+
+graphs[_seq_bucket(seq_len)].replay()
+```
+
+**必须配共享内存池。** 捕获区域内的张量分配（比如 op 里的
+`out = torch.empty_like(q)`）走的是**图的私有内存池**，默认每张图一份。实测捕获
+4 张 decode 图：
+
+```text
+各自私有内存池:   8.00 MiB
+共享同一内存池:   2.00 MiB    省 75%，正好是 1/N
+```
+
+这里绝对值小是因为 decode 的中间量本来就少。换成整个 24 层 forward 的图，
+中间激活大得多，N 张图不共享池就是 N 倍。共享池的前提是这些图不并发 replay
+（它们复用同一块中间内存），decode 严格串行，天然满足。
+
+`gqa_attention_decode.py` 里有一段 blog 风格的长注释完整讲了这套推理，
+接 decode runner 前值得先读一遍。
+
+### 8.10 一个测量陷阱
 
 不要在同一个进程里先跑 compiled 再跑 eager 做对照。dynamo 的 frame hook 会拦截
 同一个函数对象反复做 guard 检查和重编译尝试，eager 会被测成 6142 ms/token

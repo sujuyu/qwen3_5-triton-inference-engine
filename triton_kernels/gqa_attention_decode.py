@@ -327,6 +327,104 @@ def call_gqa_attention_decode_triton(
     return gqa_attention_decode(q, k_new, v_new, k_cache, v_cache, pos, hint)
 
 
+# ===========================================================================
+# 关于 CUDA Graph：这套 decode kernel 为什么长成现在这样
+# ===========================================================================
+#
+# CUDA Graph 干的事很简单：把一串 kernel launch 连同它们的参数录下来，之后一次
+# replay 就把整串重放一遍。省掉的是 CPU 侧逐次 launch 的开销——而我们实测那部分
+# 占了 eager 下 forward 时间的 92%（HANDOFF 8.1），所以对 decode 这种"每步都是
+# 一堆小 kernel"的场景，它几乎是唯一的解法。
+#
+# 但"把参数一起录下来"这句话有代价，而且代价正好落在 decode 最需要变的东西上。
+#
+# 一、标量参数会被冻结
+# --------------------
+# capture 时传进去的标量直接烧进 launch 配置，replay 只是重放，不会重新求值。
+# decode 每步 seq_len 都在涨，于是：
+#
+#     seq_len 作为标量参数：      capture 时 n=100，replay 传 300/777 得到的仍是 100
+#     seq_len 放显存 + tl.load：  replay 得到 300/777，正确
+#
+# 切片下标也一样，它最终变成 copy kernel 里的一个常量偏移：
+#
+#     cache[:, past_len, :] = v   （past_len 是 python int）  replay 三次都写第 0 行
+#     cache.index_copy_(1, pos, v)（pos 是显存张量）          replay 三次写第 0/1/2 行
+#
+# 解法是把所有"每步会变的量"收进一个显存张量。本文件里就是 `pos`：seq_len、
+# split 的 chunk、combine 的 num_active 全部由它在 kernel 内算出来，host 一个都不传。
+# 顺带一个好处是 split 和 combine 必然同源，不会对"哪些 split 有效"产生分歧。
+#
+# 更进一步，把 `pos.add_(1)` 也录进图里，位置就会随 replay 自动前进，host 侧每步
+# 只剩"写输入槽 + replay"。代价是图变成有状态的——capture 本身（warmup + 正式
+# 捕获）会把 pos 推进好几格、也会污染 cache，捕获完必须显式复位。
+#
+# 二、grid 会被冻结
+# -----------------
+# 这条绕不过去：grid 是 launch 配置的一部分，capture 之后就固定了。所以任何
+# "grid 随输入变化"的设计都与 CUDA Graph 不兼容。
+#
+# 本文件恰好躲开了这个坑，而且不完全是运气：
+#
+#     不切 T   grid=(H_kv,)               写死
+#     split    grid=(H_kv, MAX_SPLITS)    写死——MAX_SPLITS 是常数而不是随 seq_len 变
+#     combine  grid=(H_q, D//BLOCK_D)     依赖 config，但它的 autotune key 不含
+#                                          S_BUCKET，对固定模型形状是常量
+#
+# 当初把 num_splits 定成常数 MAX_SPLITS 的理由是"更多 split 没有收益"（CTA 数过
+# ~432 带宽就饱和），现在看它顺带满足了这条硬约束。而 T 方向的遍历放在 kernel
+# 内部循环里、不进 grid，也是同样的效果——随 seq_bucket 变的只有 BLOCK_T，
+# 它是循环分块，不影响 grid。
+#
+# 实测跨桶 replay（捕获时 pos=50，一路跑到 600，跨过 64 和 256 两条边界）结果正确，
+# 因为 replay 根本不会重走 Python 的 autotuner。
+#
+# 三、config 也被冻结，于是有了"每桶一张图"
+# ------------------------------------------
+# autotune 的 key 只能是 host 侧标量，所以三个 op 都额外收一个 seq_bucket: int。
+# 它不参与任何计算，只决定选哪个 config；correctness 完全由显存里的 pos 决定。
+#
+# 但 config 里的 BLOCK_T 会随 seq_bucket 变，而 capture 之后它就固定了：
+#
+#     seq_len=  64  BLOCK_T=16 warps=4 stages=2   12.53us
+#     seq_len= 256  BLOCK_T=16 warps=4 stages=2   13.37us
+#     seq_len=1024  BLOCK_T=16 warps=4 stages=1   13.43us
+#     seq_len=4095  BLOCK_T=32 warps=4 stages=2   14.51us
+#
+# 拿短序列调出来的 config 去跑长序列，只是慢一点、不会算错。当前跨度不大（12.5 ->
+# 14.5us，而且大部分是序列变长本身带来的），所以单张图够用。但要做得更好，
+# 正确的方向是**每个 bucket 捕获一张图**，按 host 已知的 seq_len 选：
+#
+#     graphs = {}
+#     pool = None
+#     for b in (64, 256, 1024, 4096):
+#         pos.fill_(b - 1); warmup()
+#         g = torch.cuda.CUDAGraph()
+#         # 关键：第二张图开始复用第一张的内存池
+#         with torch.cuda.graph(g, pool=pool) if pool else torch.cuda.graph(g):
+#             one_decode_step()
+#         pool = pool or g.pool()
+#         graphs[b] = g
+#
+#     graphs[_seq_bucket(seq_len)].replay()
+#
+# 四、为什么必须共享内存池
+# ------------------------
+# 捕获区域内的张量分配（我们这里是 op 里的 `out = torch.empty_like(q)`）走的是
+# **图的私有内存池**，默认每张图一份。图越多，这份就复制越多次。实测捕获 4 张图：
+#
+#     各自私有内存池:   8.00 MiB
+#     共享同一内存池:   2.00 MiB    省 75%，正好是 1/N
+#
+# 这里绝对值小是因为 decode 的中间量本来就少；换成整个 24 层 forward 的图，
+# 中间激活会大得多，N 张图不共享池就是 N 倍。`torch.cuda.graph(g, pool=...)`
+# 让后续的图复用前一张的池——多图方案基本必须配它一起用。
+#
+# 共享池的前提是这些图不会并发 replay（它们复用同一块中间内存）。decode 是严格
+# 串行的，天然满足。
+# ===========================================================================
+
+
 def allocate_position(device="cuda") -> torch.Tensor:
     """[1] INT64，保存"已缓存的 token 数"（= past_len），**必须放在显存里**。
 
