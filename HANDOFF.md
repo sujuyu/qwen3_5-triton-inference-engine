@@ -942,7 +942,58 @@ decode 是纯 memory-bound 且 CTA 极少，warp 数影响很大，应该覆盖�
 异步报错拉到出错点），IMA 优先怀疑 grid/索引越界而不是数学；再对比"走完整 op 路径"
 与"直调 `K.fn`"——两者结果不同就说明问题在 wrapper 而不在 kernel body。
 
-### 8.8 一个测量陷阱
+### 8.8 CUDA Graph 对标量参数的约束（decode 路径已按此改造）
+
+**CUDA Graph 在 capture 时会把标量 kernel 参数和切片下标烧进 launch 配置，
+replay 时永远用 capture 那一刻的值。** decode 每步 `seq_len` 都在变，直接传标量
+图就废了。实测对照：
+
+```text
+seq_len 作为标量参数：      capture 时 n=100，replay 传 300/777 得到的仍是 100
+seq_len 放显存 + tl.load：  replay 得到 300/777，正确
+
+cache[:, past_len, :] = v   （past_len 是 python int）  replay 三次都写第 0 行
+cache.index_copy_(1, pos, v)（pos 是显存张量）          replay 三次写第 0/1/2 行
+```
+
+同一约束适用于**所有从 host 传入、且逐步变化的量**。做法是把它们统一收敛到一个
+显存里的位置张量：
+
+```python
+pos = allocate_position()          # [1] INT64
+seq_len   = tl.load(pos_ptr) + 1   # kernel 里读
+chunk     = cdiv(seq_len, MAX_SPLITS)   # 也在 kernel 里算，host 不传
+num_active = cdiv(seq_len, chunk)
+```
+
+`chunk` 和 `num_active` 刻意在 kernel 内重算而不是从 host 传：split 和 combine
+必须用同一个来源，否则两边对"哪些 split 有效"的理解可能不一致，读到残留的局部量。
+
+dtype 用 INT64 是因为 `index_copy_` 要求 index 为 long；kernel 里 load 之后立刻
+`.to(tl.int32)`，避免后续 int64 运算。
+
+**图内自增**：把 `pos.add_(1)` 也捕获进图，每次 replay 位置自动前进，host 侧一行
+都不用碰。整个 decode step 塞进一张图之后，host 每步只剩「写输入槽 + `g.replay()`」。
+
+**这让图变成有状态的**，有两个后果：
+
+1. capture 过程本身（warmup + 正式捕获）会把 `pos` 推进好几格、也会污染 cache，
+   **捕获完必须显式复位**；
+2. 换 prompt、或 prefill 之后重新开始，同样要复位。真实 runner 应该有显式的
+   `reset()` 而不是靠调用方记得。
+
+**grid 必须在 capture 时固定**，这是 cudagraph 绕不过去的硬约束。`MAX_SPLITS` 当初
+定成常数（而不是让 `num_splits` 随 seq_len 变）正是为此——否则连 grid 都得想办法。
+
+autotune 的 key 只能是 host 侧标量，所以三个 op 都额外收一个 `seq_bucket: int`。
+**它只影响选哪个 config，不参与任何计算**；graph 下 config 冻结在 capture 那一刻，
+选错只是慢一点、不会算错。correctness 全部由显存里的 `pos` 决定。
+
+改造范围只有 GQA 的三个 decode op——`conv4_decode` 和 `gdn_recurrent_decode`
+都不含随步变化的标量，不用动。`gqa_attention_decode.py` 的第 5 段测试做了完整验证：
+捕获 1 次、replay 32 次、`pos` 自动 8 -> 40，结果与整段 causal prefill 一致。
+
+### 8.9 一个测量陷阱
 
 不要在同一个进程里先跑 compiled 再跑 eager 做对照。dynamo 的 frame hook 会拦截
 同一个函数对象反复做 guard 检查和重编译尝试，eager 会被测成 6142 ms/token
