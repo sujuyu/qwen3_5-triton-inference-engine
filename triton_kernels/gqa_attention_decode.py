@@ -396,9 +396,21 @@ def _torch_reference(
 # 每个 split 内部循环的长度（chunk = cdiv(seq_len, MAX_SPLITS)），不是 buffer 大小。
 # 这与 KV cache 本身预分配到 T_max 是同一个思路。
 #
-# 代价：seq_len 小时大部分 split 空转。它们**必须显式写** m=-inf, l=0, acc=0
-# （不能让 buffer 保持未初始化）；combine 里 exp(-inf - m) = 0，这些 split 自动
-# 贡献 0，不需要特判。空 CTA 读几个字节就退出，几乎免费。
+# 代价：seq_len 小时大部分 split 空转。**处理方式是完全不用分支**：
+# `tl.range(start, end, BLOCK_T)` 在 start >= end 时零次迭代，循环体不执行；
+# store 无条件做，写的就是初始值 m=-inf, l=0, acc=0，正是空 split 应有的值。
+# combine 里 exp(-inf - m) = 0，这些 split 自动贡献 0，不需要特判。
+#
+# 实测过"用 if 包住 store 以跳过空 split 的写"，结论是不要这么做：
+#
+#     seq_len   活跃split   无条件 store   if 包住 store     差异
+#           7          7        4.74us       4.73us       0.1%
+#         128        128        7.22us       9.10us     -26.1%   ← if 版慢
+#        1024        128        9.24us       9.21us       0.4%
+#        8192        128       14.14us      14.15us      -0.0%
+#
+# seq_len=128 时所有 split 都活跃、分支恒为真，if 版仍慢 26%——分支本身干扰了
+# codegen；而它想省的写流量在 seq_len=7 上根本没测出收益。
 #
 # chunk 和 seq_len 都是**运行时标量**，不要做成 tl.constexpr——它们随 seq_len 变，
 # 做成 constexpr 就是每个取值触发一次重编译（T_BUCKET 跨桶那几十秒已经吃过一次）。
@@ -454,43 +466,56 @@ def _gqa_attention_decode_split_triton(
     S_BUCKET: tl.constexpr,
     BLOCK_T: tl.constexpr,
 ):
-    # TODO(kernel): 与不切 T 的版本几乎一样，只是循环范围换成本 split 的区间。
-    #
-    #   pid_h = tl.program_id(0)      # KV head，0..H_kv-1
-    #   pid_s = tl.program_id(1)      # split，0..MAX_SPLITS-1
-    #
-    #   start = pid_s * chunk
-    #   end   = tl.minimum(start + chunk, seq_len)
-    #
-    #   offset_h = pid_h * GROUP + tl.arange(0, GROUP)
-    #   offset_d = tl.arange(0, D)
-    #
-    #   m_i = tl.zeros([GROUP], tl.float32) - float('inf')
-    #   l_i = tl.zeros([GROUP], tl.float32)
-    #   acc = tl.zeros([GROUP, D], tl.float32)
-    #
-    #   if start < end:                        # 空 split 跳过整个循环
-    #       q = tl.load(...) 同不切 T 的版本
-    #       k_cache_ptr += pid_h * stride_kc_h
-    #       v_cache_ptr += pid_h * stride_vc_h
-    #       for t0 in tl.range(start, end, BLOCK_T):
-    #           ... 与不切 T 的版本逐行相同，只是 mask 用 offset_t < end ...
-    #
-    #   # 无论空不空都要写：空 split 写 m=-inf, l=0, acc=0
-    #   tl.store(m_partial_ptr + offset_h * stride_mp_h + pid_s * stride_mp_s, m_i)
-    #   tl.store(l_partial_ptr + offset_h * stride_lp_h + pid_s * stride_lp_s, l_i)
-    #   tl.store(acc_partial_ptr + offset_h[:, None] * stride_ap_h
-    #            + pid_s * stride_ap_s + offset_d[None, :] * stride_ap_d, acc)
-    #
-    # 要点：
-    # - **acc 不要在这里除以 l_i**，除法在 combine 里做。这里写的是
-    #   acc_i = sum_t exp(s_t - m_i) * v_t，l_i = sum_t exp(s_t - m_i)。
-    # - mask 用 `offset_t < end` 而不是 `< seq_len`——本 split 只负责 [start, end)。
-    #   尾块仍然必须显式置 -inf，理由同不切 T 的版本。
-    # - scratch 是 FP32，直接存 acc，不要降到 BF16：跨 split 归约时还要再乘一个
-    #   缩放因子，提前降精度会累积误差。
-    tl.static_assert(D % 16 == 0)
 
+    pid_h, pid_s = tl.program_id(0), tl.program_id(1)
+
+    k_cache_ptr = k_cache_ptr + pid_h * stride_kc_h
+    v_cache_ptr = v_cache_ptr + pid_h * stride_vc_h
+
+    start = pid_s * chunk
+    end = tl.minimum(start + chunk, seq_len)
+
+    offset_h = pid_h * GROUP + tl.arange(0, GROUP)
+    offset_d = tl.arange(0, D)
+
+    m_i = tl.zeros([GROUP], tl.float32) - float('inf')
+    acc = tl.zeros([GROUP, D], tl.float32)
+    l_i = tl.zeros([GROUP], tl.float32)
+
+    q = tl.load(q_ptr + offset_h[:, None] * stride_q_h + offset_d[None, :] * stride_q_d)
+
+    for t0 in tl.range(start, end, BLOCK_T):
+        offset_t = t0 + tl.arange(0, BLOCK_T)
+        k = tl.load(
+            k_cache_ptr + offset_t[None, :] * stride_kc_t + offset_d[:, None] * stride_kc_d,
+            mask=offset_t[None, :] < end,
+            other = 0.0
+        )
+        qk = tl.dot(q, k) * scale
+        qk = tl.where(offset_t[None, :] < end, qk, -float('inf'))
+        m_i_new = tl.maximum(m_i, tl.max(qk, axis = 1))
+        alpha = tl.exp(m_i - m_i_new)
+        p = tl.exp(qk - m_i_new[:, None])
+
+        v = tl.load(
+            v_cache_ptr + offset_t[:, None] * stride_vc_t + offset_d[None, :] * stride_vc_d,
+            mask=offset_t[:, None] < end,
+            other = 0.0
+        )
+
+        acc = acc * alpha[:, None] + tl.dot(p.to(tl.bfloat16), v)
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+        m_i = m_i_new
+    
+    tl.store(
+        m_partial_ptr + offset_h * stride_mp_h + pid_s * stride_mp_s, m_i
+    )
+    tl.store(
+        l_partial_ptr + offset_h * stride_lp_h + pid_s * stride_lp_s, l_i
+    )
+    tl.store(
+        acc_partial_ptr + offset_h[:, None] * stride_ap_h + pid_s * stride_ap_s + offset_d[None, :] * stride_ap_d, acc
+    )
 
 combine_autotune_configs = [
     triton.Config({"BLOCK_D": block_d}, num_warps=warps, num_stages=1)
@@ -518,41 +543,45 @@ def _gqa_attention_decode_combine_triton(
     out_ptr,  # [H_q, D] BF16
     stride_o_h: tl.constexpr,
     stride_o_d: tl.constexpr,
+    num_active,  # 运行时 = cdiv(seq_len, chunk)，超出的 split 掩掉不读
     D: tl.constexpr,
     MAX_SPLITS_C: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
-    # TODO(kernel): 归约。grid = (H_q, D // BLOCK_D)。
-    #
-    # **grid 别用 (H_q,)**：它要读 1 MB 的 acc_partial，8 个 CTA 只有 43 GB/s -> 23us，
-    # 而整个 split-K 的目标才 39us。切出 D 维之后 BLOCK_D=64 时是 32 个 CTA -> 164 GB/s。
-    #
-    #   pid_h = tl.program_id(0)      # Q head
-    #   pid_d = tl.program_id(1)
-    #   offset_s = tl.arange(0, MAX_SPLITS_C)
-    #   offset_d = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
-    #
-    #   m_all = tl.load(m_partial_ptr + pid_h*stride_mp_h + offset_s*stride_mp_s)
-    #   m = tl.max(m_all, axis=0)                      # 全局 max
-    #   rescale = tl.exp(m_all - m)                    # [MAX_SPLITS]，空 split 得 0
-    #
-    #   l_all = tl.load(l_partial_ptr + pid_h*stride_lp_h + offset_s*stride_lp_s)
-    #   l = tl.sum(l_all * rescale, axis=0)
-    #
-    #   acc_all = tl.load(acc_partial_ptr + pid_h*stride_ap_h
-    #                     + offset_s[:, None]*stride_ap_s + offset_d[None, :]*stride_ap_d)
-    #   acc = tl.sum(acc_all * rescale[:, None], axis=0)   # [BLOCK_D]
-    #
-    #   tl.store(out_ptr + pid_h*stride_o_h + offset_d*stride_o_d,
-    #            (acc / l).to(out_ptr.dtype.element_ty))
-    #
-    # 要点：
-    # - 空 split 的 m 是 -inf，`exp(-inf - m)` 给 0，于是它们对 l 和 acc 都贡献 0，
-    #   **不需要特判**。前提是全局 m 有限——至少一个 split 有数据（seq_len >= 1），
-    #   所以成立。
-    # - MAX_SPLITS 必须是 2 的幂，`tl.arange` 才能用。
-    # - 全部在 FP32 里算，只在最后 store 时降到 BF16。
-    tl.static_assert(D % BLOCK_D == 0)
+    # H_q维度上肯定可以切 但是这么点CTA肯定吃不满sm
+    # 在D维度上也进行切分 主要是增加m和l的读取量 但是m l本身很小 L2cache完全可以兜住 代价很小 
+
+    pid_h, pid_d = tl.program_id(0), tl.program_id(1)
+    offset_s = tl.arange(0, MAX_SPLITS_C)
+    offset_d = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
+
+    m_all = tl.load(
+        m_partial_ptr + pid_h * stride_mp_h + offset_s * stride_mp_s,
+        mask = offset_s < num_active, 
+        other = -float('inf')
+    ) # [MAX_SPLITS]
+    l_all = tl.load(
+        l_partial_ptr + pid_h * stride_lp_h + offset_s * stride_lp_s,
+        mask = offset_s < num_active,
+        other = 0.0
+    ) # [MAX_SPLITS]
+    acc_all = tl.load(
+        acc_partial_ptr + pid_h * stride_ap_h + offset_s[:, None] * stride_ap_s + offset_d[None, :] * stride_ap_d,
+        mask = offset_s[:, None] < num_active,
+        other = 0.0
+    )
+
+    m = tl.max(m_all, axis = -1) # 单独head下这是一个标量单值
+    alpha = tl.exp(m_all - m) # [MAX_SPLITS]
+    l = tl.sum(l_all * alpha, axis = -1) # 单独head下这是一个标量单值
+    
+    acc_all = tl.sum(acc_all * alpha[:, None], axis = 0) # [D]
+    acc_all /= l
+    
+    tl.store(
+        out_ptr + pid_h * stride_o_h + offset_d * stride_o_d,
+        acc_all.to(out_ptr.dtype.element_ty)
+    )
 
 
 @torch.library.triton_op(
@@ -629,6 +658,7 @@ def gqa_attention_decode_combine(
     m_partial: torch.Tensor,
     l_partial: torch.Tensor,
     acc_partial: torch.Tensor,
+    num_active: int,
 ) -> torch.Tensor:
     num_q_heads, _, head_dim = acc_partial.shape
     out = torch.empty(
@@ -652,6 +682,7 @@ def gqa_attention_decode_combine(
         out_ptr=out,
         stride_o_h=out.stride(0),
         stride_o_d=out.stride(1),
+        num_active=num_active,
         D=head_dim,
         MAX_SPLITS_C=MAX_SPLITS,
     )
@@ -659,7 +690,7 @@ def gqa_attention_decode_combine(
 
 
 @torch.library.register_fake("wy_lib::gqa_attention_decode_combine")
-def _gqa_attention_decode_combine_fake(m_partial, l_partial, acc_partial):
+def _gqa_attention_decode_combine_fake(m_partial, l_partial, acc_partial, num_active):
     return torch.empty(
         (acc_partial.shape[0], acc_partial.shape[2]),
         dtype=torch.bfloat16,
@@ -698,10 +729,14 @@ def call_gqa_attention_decode_split_triton(
     if scratch is None:
         scratch = allocate_split_scratch(q.shape[0], q.shape[1], device=q.device)
     m_partial, l_partial, acc_partial = scratch
+    seq_len = past_len + 1
+    chunk = triton.cdiv(seq_len, MAX_SPLITS)
     gqa_attention_decode_split(
         q, k_new, v_new, k_cache, v_cache, m_partial, l_partial, acc_partial, past_len
     )
-    return gqa_attention_decode_combine(m_partial, l_partial, acc_partial)
+    return gqa_attention_decode_combine(
+        m_partial, l_partial, acc_partial, triton.cdiv(seq_len, chunk)
+    )
 
 
 def _torch_reference_split(

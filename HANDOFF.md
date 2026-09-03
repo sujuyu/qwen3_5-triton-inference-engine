@@ -319,8 +319,27 @@ kernel 里 `offset_h = pid * GROUP + tl.arange(0, GROUP)`，用 `num_q_heads` �
 用来抓尾块没置 `-inf` 的 bug），最大绝对误差 ≤ `0.015625`；外加一条越界保护检查——
 把 cache 中 `past_len` 之后填 NaN，结果必须完全不变。
 
-**下一步必须做 split-K，不是可选优化。** 实测 2 个 CTA 即使开 16 warp 也只有饱和带宽
-的 4%（46 GB/s vs 1170 GB/s），天花板由"只占 2 个 SM"决定。详见 8.6。
+**split-K 版已完成**，同文件里的 `gqa_attention_decode_split` + `gqa_attention_decode_combine`，
+用 `call_gqa_attention_decode_split_triton()` 串起来，接口与不切 T 的版本完全一致。
+不切 T 的版本保留作对拍基准。
+
+CUDA Graph 下的纯 GPU 时间（已摘掉 `torch.library` 分发开销）：
+
+```text
+    T      不切T    split-K    加速     ×6层不切T   ×6层split
+  512     24.6us    10.8us    2.3x      0.148ms    0.065ms
+ 2048     68.8us    12.4us    5.6x      0.413ms    0.074ms
+ 8192    244.7us    19.1us   12.8x      1.468ms    0.115ms
+32768   1022.8us    68.4us   15.0x      6.137ms    0.410ms
+```
+
+不切 T 的版本随 T 线性增长（2 个 CTA 扫完整个序列），split-K 基本平坦。对照每个
+decode step 必须读一遍 1.4 GiB 权重的 1.23 ms 地板：**不切 T 在 T=8192 时 attention
+就和整个模型的权重读取一样贵，split-K 只占 9%**。
+
+**注意别在 eager 下量这个对比**：那里 split-K 反而"更慢"（T=512 时 246 vs 138us），
+因为它走两次 `torch.library` 分发、每次 50-90us（8.2），完全盖过 GPU 时间。
+同样的陷阱见 8.5。
 
 ### 3.9 `gdn_qk_norm_gates.py` — `wy_lib::gdn_qk_norm_gates`
 
@@ -960,8 +979,7 @@ decode 是纯 memory-bound 且 CTA 极少，warp 数影响很大，应该覆盖�
    那 6 层 attention 也拿不到"只有一个新 token"的输入：
 
    - ~~`depthwise_causal_conv4_decode`~~ **已完成**，见 3.8b；
-   - ~~带 KV cache 的 GQA decode kernel~~ **已完成**，见 3.3b。但它目前 grid 只有
-     2 个 CTA，只有饱和带宽的 4%，**必须先补 split-K**（见 8.6）才能真正用；
+   - ~~带 KV cache 的 GQA decode kernel~~ **已完成**（含 split-K），见 3.3b；
    - GDN 侧直接接已有的 `gdn_recurrent_decode`（state cache 路径已验证）。
 
    齐了之后把 runner 拆成 prefill + decode 两条路径，用当前的完整重算版本做等价性
