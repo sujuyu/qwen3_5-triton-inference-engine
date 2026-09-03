@@ -1085,7 +1085,71 @@ allocator 按大小从 free list 找最佳匹配。多图方案里 N 张图跑�
 `gqa_attention_decode.py` 里有一段 blog 风格的长注释完整讲了这套推理，
 接 decode runner 前值得先读一遍。
 
-### 8.10 一个测量陷阱
+### 8.10 上面这些在 PyTorch C++ 里的对应实现
+
+上面 8.8 / 8.9 的结论都是黑盒实测出来的。回头对了一遍 PyTorch 源码
+（`~/pytorch`，`a57db29aa6d`），实现与实测完全吻合，而且注释里写得比我们推断的更清楚。
+记在这里，是因为「为什么 capture 的激活不会被内存压力回收」是个很自然的担心，
+值得知道它是怎么被解决的。
+
+**隔离靠 `PrivatePool`**（`c10/cuda/CUDACachingAllocator.cpp:1239`）：
+
+```cpp
+struct PrivatePool {
+  MempoolId_t id{0, 0};
+  int use_count{1};          // 有多少张活着的图在用这个池
+  int cudaMalloc_count{0};
+  BlockPool large_blocks;    // 自己的 free list
+  BlockPool small_blocks;
+};
+```
+
+注释里解释了为什么要独立容器而不是在全局池里加 pool id 判断：
+「BlockComparator is performance-critical though, I'd rather not add more logic to it.」
+所以隔离是"每个池自带一套 `std::set<Block*>`"——这正是我们实测到的
+「池与普通分配互不通用」。
+
+`beginAllocateToPool` / `endAllocateToPool`（3108 / 3124 行）在 capture 前后开关一个
+allocation scope，把该 stream 上的分配路由到指定 `MempoolId_t`。
+**`torch.cuda.graph(g, pool=...)` 不过是两次 capture 传了同一个 id。**
+
+**生命周期靠 `use_count`**。`releasePool`（3217 行）的注释直接回答了"为什么不能
+capture 完就释放"：
+
+```text
+We can't blindly delete and cudaFree the mempool its capture used, because
+ 1. other graph(s) might share the same pool
+ 2. the user might still hold references to output tensors allocated during capture.
+```
+
+`--use_count` 归零才把池挪进 `graph_pools_freeable`；而 `emptyCache` 走的
+`release_cached_blocks`（4060 行）**只遍历 `graph_pools_freeable`**：
+
+```cpp
+for (auto it = graph_pools_freeable.begin(); it != graph_pools_freeable.end();) {
+  TORCH_INTERNAL_ASSERT(it->second->use_count == 0);   // 只碰已归零的
+  release_blocks(it->second->small_blocks, context);
+  release_blocks(it->second->large_blocks, context);
+```
+
+于是链条是：图活着 → `use_count > 0` → 池不在 `graph_pools_freeable` 里 →
+`release_cached_blocks` 根本不遍历它 → `emptyCache` 和内存压力都动不了。
+
+**注意 `use_count` 是 `PrivatePool` 独有的字段，普通 BlockPool 没有。** 所以不能说
+"即便走普通 allocator 也有 use_count 兜底"——保护本身就来自私有池。如果这些块在
+普通池里，回收只看 tensor 引用计数：capture 结束时中间量的 Python 引用一失效，
+块就回到普通 free list，随时可能被别的分配拿走、甚至整个 segment 被 `cudaFree`，
+replay 就会写到别人的数据上或未映射的地址。
+
+**两层保护缺一不可，且第 2 条依赖第 1 条**——没有私有池这个容器，就没有地方挂
+`use_count`。
+
+顺带：`CUDAGraph.cpp` 的 `retain_pool()` / `has_retained_pool()`（83-98 行）允许在图
+销毁后继续抬着 `use_count`，对应上面注释里的第 2 种情形。所以池的释放条件精确说
+不是"图被删除"，而是 **`use_count` 归零 且 块变成 unused**——单张图时两者时机重合，
+共享池或 retain 时才分开。
+
+### 8.11 一个测量陷阱
 
 不要在同一个进程里先跑 compiled 再跑 eager 做对照。dynamo 的 frame hook 会拦截
 同一个函数对象反复做 guard 检查和重编译尝试，eager 会被测成 6142 ms/token
