@@ -48,12 +48,14 @@ A100-SXM4-40GB 实测：
 
 ```
                     加载+prefill+捕获    稳态生成
-CUDA Graph              2.8s           2.7 ms/token
-eager（逐 op）           2.1s          42.7 ms/token
+CUDA Graph              2.7s           2.3 ms/token
+eager（逐 op）           2.1s          35.6 ms/token
 ```
 
-decode 的 GPU 时间里 gemm 占六成,这部分现在跑在 HBM 带宽的 30%~67% 之间,
-还有空间。eager 那条基本不受影响,因为它卡在 CPU 侧的算子分发上,不是 GPU。
+decode 一步 349 次 kernel 启动，其中 gemm 96 次占掉一半时间。图内每次启动有约
+1.9us 不可压缩的固定成本，加上 ramp-up 和 drain 合计约 4us，所以现在「让 kernel
+更少更大」比「让 kernel 更快」值钱。eager 那条卡在 CPU 侧的算子分发上，
+和 GPU 侧的改动基本无关。
 
 ```console
 $ python demo.py "李世民是谁？和朱棣有什么共同点？"

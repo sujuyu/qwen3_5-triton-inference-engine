@@ -281,10 +281,14 @@ class Qwen35Runner:
         head_dim = self.w.linear_head_dim
         key_dim = heads * head_dim
 
-        qkv = gemm_2d(h, w.in_proj_qkv)  # [1,6144]
-        z = gemm_2d(h, w.in_proj_z)
-        a = gemm_2d(h, w.in_proj_a)
-        b = gemm_2d(h, w.in_proj_b)
+        # 四个投影共享同一个 h，合成一次 [8224,1024] 的 GEMV 再切开。
+        # 切片在 M=1 下是连续的（长度为 1 的维不参与连续性判定），下游可以直接 view。
+        # 切分点必须和 loader._fuse_rows 里的拼接顺序一致。
+        fused = gemm_2d(h, w.in_proj_fused)  # [1,8224]
+        qkv = fused[:, : 3 * key_dim]  # [1,6144]
+        z = fused[:, 3 * key_dim : 4 * key_dim]  # [1,2048]
+        a = fused[:, 4 * key_dim : 4 * key_dim + heads]  # [1,16]
+        b = fused[:, 4 * key_dim + heads :]  # [1,16]
 
         # conv_state 存的是 conv 的**输入**（in_proj_qkv 的输出），不是输出也不是
         # SiLU 之后的值。这个 op 会就地推进 state。权重要用 [4,D] 那份。
@@ -316,10 +320,15 @@ class Qwen35Runner:
             self.w.head_dim,
         )
 
-        q_raw = gemm_2d(h, w.q_proj_q)  # [1,2048]
-        gate = gemm_2d(h, w.q_proj_gate)
-        k_raw = gemm_2d(h, w.k_proj)  # [1,512]
-        v_raw = gemm_2d(h, w.v_proj)
+        # 同 _gdn_decode：四个投影共享 h，合成一次 [5120,1024] 的 GEMV。
+        # 注意 q_raw/k_raw 随后要喂给 qwen_rmsnorm，那是全仓库唯一要求 contiguous
+        # 的 kernel——M=1 时切片仍然连续，所以这里成立；prefill 路径不能这么做。
+        fused = gemm_2d(h, w.qkvg_fused)  # [1,5120]
+        qd, kd = nh * d, nkv * d
+        q_raw = fused[:, :qd]  # [1,2048]
+        gate = fused[:, qd : 2 * qd]  # [1,2048]
+        k_raw = fused[:, 2 * qd : 2 * qd + kd]  # [1,512]
+        v_raw = fused[:, 2 * qd + kd :]  # [1,512]
 
         q = qwen_rmsnorm(q_raw.view(1, nh, d), w.q_norm, self.eps)
         k = qwen_rmsnorm(k_raw.view(1, nkv, d), w.k_norm, self.eps)
@@ -384,7 +393,12 @@ class Qwen35Runner:
 
             residual = x
             h = qwen_rmsnorm(x, layer.post_attention_layernorm, self.eps)
-            h = swiglu(gemm_2d(h, layer.mlp.gate_proj), gemm_2d(h, layer.mlp.up_proj))
+            # gate 和 up 共享 h，合成一次 [7168,1024] 的 GEMV。这一组两边尺寸相同、
+            # CTA 数本来就够，所以只省下一次 kernel 的固定成本（约 4us），
+            # 不像 GDN/attn 那两组能一次消掉三个。
+            gate_up = gemm_2d(h, layer.mlp.gate_up)  # [1,7168]
+            inter = layer.mlp.down_proj.shape[1]
+            h = swiglu(gate_up[:, :inter], gate_up[:, inter:])
             h = gemm_2d(h, layer.mlp.down_proj)
             x = residual_add(h, residual)
 

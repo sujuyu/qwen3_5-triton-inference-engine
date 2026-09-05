@@ -43,11 +43,48 @@ EXPECTED_NUM_ATTN_LAYERS = 6
 FULL_ATTENTION_LAYERS = (3, 7, 11, 15, 19, 23)
 
 
+def _fuse_rows(parts: list[torch.Tensor]) -> tuple[torch.Tensor, list[torch.Tensor]]:
+    """把若干个 `[N_i, K]` 的权重沿输出维拼成一块，返回整块和指向它的行 view。
+
+    为什么要拼
+    ----------
+    decode 时 M 恒为 1，这些 GEMV 共享同一个输入 h，所以
+    `y_i = h @ W_i.T` 可以合成 `Y = h @ cat(W_i).T` 再切输出，数学上是恒等的。
+    收益不是省字节也不是省 FLOPs（两者完全不变），而是**每消掉一个 kernel 就省
+    约 4us 的固定成本**：其中约 1.9us 是 GPU 侧的 grid 分发与完成信号（CUDA Graph
+    也压不掉），其余约 2us 是 ramp-up 和 drain——kernel 开头第一次 K 循环的访存没有
+    任何东西可以与之重叠，结尾则是最后几个 CTA 收尾时 SM 空转，而同一 stream 里
+    相邻 kernel 之间有隐式屏障，前一个的 drain 没法和后一个的 ramp 重叠。
+
+    实测每组的收益都严格等于「消掉的 kernel 数 × 约 4us」，与被消掉的是大矩阵还是
+    小矩阵无关：GDN 消 3 个省 11.92us，attn 消 3 个省 13.33us，MLP 消 1 个省 3.89us。
+
+    为什么返回 view 而不是留着原张量
+    --------------------------------
+    **按行切一块 `[N,K]` 的连续张量，得到的仍然是连续张量**（stride 保持 (K,1)）。
+    所以 prefill 那条路径继续用这些 view 时，拿到的东西和融合前完全一样，代码一行
+    不用改，也不多占一点显存。
+
+    反过来，**输出的切片就只在 M=1 时连续**：`[1,8224][:, 0:6144]` 的 stride 是
+    (8224,1)，但长度为 1 的维不参与连续性判定，所以是连续的；`[64,8224]` 同样切法
+    就不是了。而 `qwen_rmsnorm` 是全仓库唯一要求 contiguous 的 kernel，attn 的
+    q_norm/k_norm 正好用它。这就是融合只用在 decode 路径、prefill 保持原样的原因。
+    """
+    fused = torch.cat(parts, dim=0).contiguous()
+    views: list[torch.Tensor] = []
+    offset = 0
+    for part in parts:
+        views.append(fused[offset : offset + part.shape[0]])
+        offset += part.shape[0]
+    return fused, views
+
+
 @dataclass(frozen=True)
 class MLPWeights:
-    gate_proj: torch.Tensor  # [3584,1024] BF16
-    up_proj: torch.Tensor  # [3584,1024] BF16
+    gate_proj: torch.Tensor  # [3584,1024] BF16，gate_up 的行 view
+    up_proj: torch.Tensor  # [3584,1024] BF16，gate_up 的行 view
     down_proj: torch.Tensor  # [1024,3584] BF16
+    gate_up: torch.Tensor  # [7168,1024] BF16，decode 用整块打一次 GEMV
 
 
 @dataclass(frozen=True)
@@ -56,10 +93,12 @@ class GDNLayerWeights:
 
     input_layernorm: torch.Tensor  # [1024] BF16
     post_attention_layernorm: torch.Tensor  # [1024] BF16
+    # 下面四个都是 in_proj_fused 的行 view，prefill 用；decode 用整块
     in_proj_qkv: torch.Tensor  # [6144,1024] BF16
     in_proj_z: torch.Tensor  # [2048,1024] BF16
     in_proj_a: torch.Tensor  # [16,1024] BF16
     in_proj_b: torch.Tensor  # [16,1024] BF16
+    in_proj_fused: torch.Tensor  # [8224,1024] BF16 = cat(qkv, z, a, b)
     conv1d: torch.Tensor  # [6144,4] BF16，prefill 用
     conv1d_decode: torch.Tensor  # [4,6144] BF16 contiguous，decode 用
     a_log: torch.Tensor  # [16] FP32
@@ -77,10 +116,12 @@ class AttnLayerWeights:
 
     input_layernorm: torch.Tensor  # [1024] BF16
     post_attention_layernorm: torch.Tensor  # [1024] BF16
+    # 下面四个都是 qkvg_fused 的行 view，prefill 用；decode 用整块
     q_proj_q: torch.Tensor  # [2048,1024] BF16，从 q_proj 拆出的 Q 部分
     q_proj_gate: torch.Tensor  # [2048,1024] BF16，从 q_proj 拆出的 gate 部分
     k_proj: torch.Tensor  # [512,1024] BF16
     v_proj: torch.Tensor  # [512,1024] BF16
+    qkvg_fused: torch.Tensor  # [5120,1024] BF16 = cat(q, gate, k, v)
     q_norm: torch.Tensor  # [256] BF16
     k_norm: torch.Tensor  # [256] BF16
     o_proj: torch.Tensor  # [1024,2048] BF16
@@ -176,10 +217,17 @@ class _TensorSource:
 
 def _load_mlp(src: _TensorSource, prefix: str, hidden: int, inter: int) -> MLPWeights:
     bf16 = torch.bfloat16
+    # gate 和 up 吃同一个输入，融合成 [7168,1024] 一次算完；down 的输入是 swiglu
+    # 的输出，融合不进来。
+    gate_up, (gate, up) = _fuse_rows([
+        src.get(f"{prefix}mlp.gate_proj.weight", shape=(inter, hidden), dtype=bf16),
+        src.get(f"{prefix}mlp.up_proj.weight", shape=(inter, hidden), dtype=bf16),
+    ])
     return MLPWeights(
-        gate_proj=src.get(f"{prefix}mlp.gate_proj.weight", shape=(inter, hidden), dtype=bf16),
-        up_proj=src.get(f"{prefix}mlp.up_proj.weight", shape=(inter, hidden), dtype=bf16),
+        gate_proj=gate,
+        up_proj=up,
         down_proj=src.get(f"{prefix}mlp.down_proj.weight", shape=(hidden, inter), dtype=bf16),
+        gate_up=gate_up,
     )
 
 
@@ -245,22 +293,31 @@ def load_text_weights(
                     dtype=bf16,
                 )
                 q_proj_q, q_proj_gate = _split_q_proj(q_proj, num_heads, head_dim)
+                # q / gate / k / v 都吃同一个 h，融合成 [5120,1024]。顺序即输出的
+                # 切片顺序，改这里必须同步改 runner._attention_decode。
+                qkvg_fused, (q_proj_q, q_proj_gate, k_proj, v_proj) = _fuse_rows([
+                    q_proj_q,
+                    q_proj_gate,
+                    src.get(
+                        f"{p}self_attn.k_proj.weight",
+                        shape=(num_kv_heads * head_dim, hidden),
+                        dtype=bf16,
+                    ),
+                    src.get(
+                        f"{p}self_attn.v_proj.weight",
+                        shape=(num_kv_heads * head_dim, hidden),
+                        dtype=bf16,
+                    ),
+                ])
                 layers.append(
                     AttnLayerWeights(
                         input_layernorm=input_ln,
                         post_attention_layernorm=post_ln,
                         q_proj_q=q_proj_q,
                         q_proj_gate=q_proj_gate,
-                        k_proj=src.get(
-                            f"{p}self_attn.k_proj.weight",
-                            shape=(num_kv_heads * head_dim, hidden),
-                            dtype=bf16,
-                        ),
-                        v_proj=src.get(
-                            f"{p}self_attn.v_proj.weight",
-                            shape=(num_kv_heads * head_dim, hidden),
-                            dtype=bf16,
-                        ),
+                        k_proj=k_proj,
+                        v_proj=v_proj,
+                        qkvg_fused=qkvg_fused,
                         q_norm=src.get(
                             f"{p}self_attn.q_norm.weight", shape=(head_dim,), dtype=bf16
                         ),
@@ -282,30 +339,39 @@ def load_text_weights(
                 conv1d = src.get(
                     f"{p}linear_attn.conv1d.weight", shape=(key_dim * 3, 1, 4), dtype=bf16
                 )
+                # qkv / z / a / b 都吃同一个 h，融合成 [8224,1024]。顺序即输出的
+                # 切片顺序，改这里必须同步改 runner._gdn_decode。
+                in_proj_fused, (in_qkv, in_z, in_a, in_b) = _fuse_rows([
+                    src.get(
+                        f"{p}linear_attn.in_proj_qkv.weight",
+                        shape=(key_dim * 3, hidden),
+                        dtype=bf16,
+                    ),
+                    src.get(
+                        f"{p}linear_attn.in_proj_z.weight",
+                        shape=(key_dim, hidden),
+                        dtype=bf16,
+                    ),
+                    src.get(
+                        f"{p}linear_attn.in_proj_a.weight",
+                        shape=(lin_heads, hidden),
+                        dtype=bf16,
+                    ),
+                    src.get(
+                        f"{p}linear_attn.in_proj_b.weight",
+                        shape=(lin_heads, hidden),
+                        dtype=bf16,
+                    ),
+                ])
                 layers.append(
                     GDNLayerWeights(
                         input_layernorm=input_ln,
                         post_attention_layernorm=post_ln,
-                        in_proj_qkv=src.get(
-                            f"{p}linear_attn.in_proj_qkv.weight",
-                            shape=(key_dim * 3, hidden),
-                            dtype=bf16,
-                        ),
-                        in_proj_z=src.get(
-                            f"{p}linear_attn.in_proj_z.weight",
-                            shape=(key_dim, hidden),
-                            dtype=bf16,
-                        ),
-                        in_proj_a=src.get(
-                            f"{p}linear_attn.in_proj_a.weight",
-                            shape=(lin_heads, hidden),
-                            dtype=bf16,
-                        ),
-                        in_proj_b=src.get(
-                            f"{p}linear_attn.in_proj_b.weight",
-                            shape=(lin_heads, hidden),
-                            dtype=bf16,
-                        ),
+                        in_proj_qkv=in_qkv,
+                        in_proj_z=in_z,
+                        in_proj_a=in_a,
+                        in_proj_b=in_b,
+                        in_proj_fused=in_proj_fused,
                         conv1d=conv1d.squeeze(1).contiguous(),
                         conv1d_decode=conv1d.squeeze(1)
                         .transpose(0, 1)

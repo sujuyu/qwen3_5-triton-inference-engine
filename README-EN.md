@@ -59,13 +59,15 @@ Measured on an A100-SXM4-40GB:
 
 ```
                        load+prefill+capture    steady state
-CUDA Graph                    2.8s            2.7 ms/token
-eager (op by op)              2.1s           42.7 ms/token
+CUDA Graph                    2.7s            2.3 ms/token
+eager (op by op)              2.1s           35.6 ms/token
 ```
 
-GEMM accounts for about 60% of the decode step's GPU time, currently running at
-30–67% of HBM bandwidth, so there is still headroom. The eager path is essentially
-unaffected, because it is bound by CPU-side operator dispatch rather than the GPU.
+A decode step launches 349 kernels, of which the 96 GEMMs take about half the time.
+Each launch carries roughly 1.9us of irreducible cost even inside a CUDA graph, and
+about 4us once ramp-up and drain are counted, so "fewer, larger kernels" currently
+buys more than "faster kernels". The eager path is bound by CPU-side operator
+dispatch and is largely unaffected by GPU-side work.
 
 ```console
 $ python demo.py "Explain attention in one sentence"
