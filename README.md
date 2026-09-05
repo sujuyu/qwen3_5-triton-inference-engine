@@ -48,9 +48,12 @@ A100-SXM4-40GB 实测：
 
 ```
                     加载+prefill+捕获    稳态生成
-CUDA Graph              2.7s           4.3 ms/token
-eager（逐 op）           1.9s          44.8 ms/token
+CUDA Graph              2.8s           2.7 ms/token
+eager（逐 op）           2.1s          42.7 ms/token
 ```
+
+decode 的 GPU 时间里 gemm 占六成,这部分现在跑在 HBM 带宽的 30%~67% 之间,
+还有空间。eager 那条基本不受影响,因为它卡在 CPU 侧的算子分发上,不是 GPU。
 
 ```console
 $ python demo.py "李世民是谁？和朱棣有什么共同点？"

@@ -59,9 +59,13 @@ Measured on an A100-SXM4-40GB:
 
 ```
                        load+prefill+capture    steady state
-CUDA Graph                    2.7s            4.3 ms/token
-eager (op by op)              1.9s           44.8 ms/token
+CUDA Graph                    2.8s            2.7 ms/token
+eager (op by op)              2.1s           42.7 ms/token
 ```
+
+GEMM accounts for about 60% of the decode step's GPU time, currently running at
+30–67% of HBM bandwidth, so there is still headroom. The eager path is essentially
+unaffected, because it is bound by CPU-side operator dispatch rather than the GPU.
 
 ```console
 $ python demo.py "Explain attention in one sentence"
