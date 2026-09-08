@@ -38,11 +38,16 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from engine.loader import AttnLayerWeights, GDNLayerWeights, TextWeights
+from engine.paging import PagePool, SequencePages
 from triton_kernels.depthwise_causal_conv4_decode import CONV_KERNEL_SIZE
 from triton_kernels.gqa_attention_decode import (
     allocate_kv_cache,
     allocate_position,
     allocate_split_scratch,
+)
+from triton_kernels.gqa_attention_decode_paged import (
+    PAGE_SIZE,
+    allocate_paged_kv_cache,
 )
 
 
@@ -64,6 +69,34 @@ class DecodeCaches:
 
     max_len: int
 
+    # ---- paged 专用；整块方案下都是 None ----
+    #
+    # **页表只有一张，六个 attention 层共用。** 它们的 cache 形状完全一致，
+    # 逻辑页 i 在每一层都映射到同一个物理页 j，所以没必要一层一张。
+    # 六层各有自己的 k_caches[i] / v_caches[i] 页池。
+    pages: SequencePages | None = None
+    page_pool: PagePool | None = None
+
+    @property
+    def paged(self) -> bool:
+        return self.pages is not None
+
+    @property
+    def block_table(self) -> torch.Tensor | None:
+        return None if self.pages is None else self.pages.block_table
+
+    def reserve(self, token_num: int) -> None:
+        """确保能放下 `token_num` 个 token。整块方案下退化成一次容量断言。
+
+        paged 下这是 host 侧的事，必须在会写到那个位置的 forward **之前**调用；
+        写完再发现越界就晚了（`index_copy_` 会在 device 上 assert，报错点离原因很远）。
+        """
+        assert token_num <= self.max_len, (
+            f"需要 {token_num} 个 token 的容量，超出 cache 上限 {self.max_len}"
+        )
+        if self.pages is not None:
+            self.pages.reserve(token_num, self.page_pool)
+
     def reset(self) -> None:
         """清空全部状态。换 prompt、或 CUDA Graph 捕获之后必须调用。
 
@@ -77,6 +110,11 @@ class DecodeCaches:
                     t.zero_()
         for t in self.split_scratch:
             t.zero_()
+        if self.pages is not None:
+            # 把页还回池子。严格说不清页表也能正确——kernel 只遍历
+            # `lp < cdiv(seq_len, PAGE)`，而 seq_len 来自刚归零的 pos，
+            # 残留的旧页号永远读不到。但还页是必须的，否则池子会漏。
+            self.pages.release(self.page_pool)
 
     def memory_bytes(self) -> dict[str, int]:
         def total(group):
@@ -90,10 +128,23 @@ class DecodeCaches:
         }
 
 
-def allocate_caches(w: TextWeights, max_len: int) -> DecodeCaches:
-    """按层类型分配三类 cache。一次分配，整个生成过程复用。"""
+def allocate_caches(w: TextWeights, max_len: int, *, paged: bool = False) -> DecodeCaches:
+    """按层类型分配三类 cache。一次分配，整个生成过程复用。
+
+    `paged=True` 时 attention 的 KV 改用分页布局。**batch=1 下它没有任何显存收益**
+    ——同样的 T_max 下两种方案占的字节数完全一样，paged 还多一层间接寻址。
+    它是为凑批做的铺垫：整块方案下 B 条请求要按 `B * max_len` 预留，
+    paged 只要 `sum(实际长度)`，而且请求之间能共享前缀。
+
+    GDN 的两个 cache 与 paged 无关：它们是定长的，和上下文长度没关系。
+    """
     device = w.device
     conv_dim = w.linear_num_heads * w.linear_head_dim * 3  # q+k+v = 6144
+
+    # 页数按 max_len 算，再留一页余量给「最后一个 token 正好落在新页开头」的情况
+    num_pages = (max_len + PAGE_SIZE - 1) // PAGE_SIZE + 1
+    pool = PagePool(num_pages) if paged else None
+    pages = SequencePages(num_pages, device=device) if paged else None
 
     conv_states: list[torch.Tensor | None] = []
     recurrent_states: list[torch.Tensor | None] = []
@@ -120,9 +171,15 @@ def allocate_caches(w: TextWeights, max_len: int) -> DecodeCaches:
             assert isinstance(layer, AttnLayerWeights)
             conv_states.append(None)
             recurrent_states.append(None)
-            k, v = allocate_kv_cache(
-                w.num_key_value_heads, max_len, w.head_dim, device=device
-            )
+            if paged:
+                # 每层一份页池，但页表只有一张（见 DecodeCaches.pages 的注释）
+                k, v = allocate_paged_kv_cache(
+                    num_pages, w.num_key_value_heads, w.head_dim, device=device
+                )
+            else:
+                k, v = allocate_kv_cache(
+                    w.num_key_value_heads, max_len, w.head_dim, device=device
+                )
             k_caches.append(k)
             v_caches.append(v)
 
@@ -136,4 +193,6 @@ def allocate_caches(w: TextWeights, max_len: int) -> DecodeCaches:
             w.num_attention_heads, w.head_dim, device=device
         ),
         max_len=max_len,
+        pages=pages,
+        page_pool=pool,
     )

@@ -215,6 +215,45 @@ def main() -> None:
             f"{tok_chk[first]} vs {tok_seq[first]}"
         )
 
+    # ---- 7. paged KV cache vs 整块 ---------------------------------------
+    # 两条路径的在线 softmax 和 split-K 归约完全一样，只有 K/V 的寻址不同：
+    # 整块按 token 线性扫，paged 先查页表拿物理页号再在页内偏移。所以判据可以严格
+    # 到 **greedy token 逐个相同**，而不像 GDN 那两条路径只能比噪声底。
+    #
+    # batch=1 下 paged 没有显存收益（同样的 T_max 占的字节数一样），它是为凑批做的
+    # 铺垫。这一段保证在往那个方向走的过程中，单请求这条路不会被弄坏。
+    print("\n=== paged KV cache vs 整块 ===")
+    paged_caches = allocate_caches(runner.w, prompt_len + n_steps + 32, paged=True)
+    paged_tokens = runner.generate_cached(
+        prompt, max_new_tokens=n_steps, stop_ids=None, caches=paged_caches
+    )
+    print(f"  整块 : {ref_tokens[:8]} ...")
+    print(f"  paged: {paged_tokens[:8]} ...")
+    if paged_tokens == ref_tokens:
+        print(f"  {len(ref_tokens)} 个 greedy token 逐个相同 ✓")
+    else:
+        first = next(
+            i for i, (a, b) in enumerate(zip(paged_tokens, ref_tokens)) if a != b
+        )
+        raise AssertionError(
+            f"paged 与整块在第 {first} 个 token 分叉："
+            f"{paged_tokens[first]} vs {ref_tokens[first]}"
+        )
+
+    # 页在 reset 时必须还回池子，否则连续跑几轮就会漏光
+    free_before = paged_caches.page_pool.num_free
+    paged_caches.reset()
+    assert paged_caches.page_pool.num_free == paged_caches.page_pool.num_pages, (
+        f"reset 之后页没还干净：剩 {paged_caches.page_pool.num_free} / "
+        f"{paged_caches.page_pool.num_pages}"
+    )
+    again = runner.generate_cached(
+        prompt, max_new_tokens=8, stop_ids=None, caches=paged_caches
+    )
+    assert again == ref_tokens[:8], "paged 复用同一份 caches 后结果不一致"
+    print(f"  页池：占用中 {paged_caches.page_pool.num_pages - free_before} 页 -> "
+          f"reset 后全部归还 -> 复用结果一致 ✓")
+
     print("\nAll decode parity tests passed.")
 
 

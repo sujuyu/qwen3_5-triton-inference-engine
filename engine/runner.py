@@ -45,6 +45,10 @@ from triton_kernels.gdn_recurrent_prefill import (
 from triton_kernels.gqa_attention_decode import (
     call_gqa_attention_decode_split_triton,
 )
+from triton_kernels.gqa_attention_decode_paged import (
+    call_paged_gqa_attention_decode_triton,
+    paged_kv_fill,
+)
 from engine.cache import DecodeCaches, allocate_caches
 from triton_kernels.gemm_2d import gemm_2d
 from triton_kernels.gqa_attention_without_kvcache_casual import (
@@ -211,6 +215,7 @@ class Qwen35Runner:
         trace: dict | None,
         tag: str,
         fill: tuple[torch.Tensor, torch.Tensor] | None = None,
+        block_table: torch.Tensor | None = None,
     ):
         token_num = h.shape[0]
         nh = self.w.num_attention_heads
@@ -244,9 +249,14 @@ class Qwen35Runner:
 
         if fill is not None:
             k_cache, v_cache = fill
-            # 存 RoPE **之后**的 K；v4 是 permute 出来的 view，copy_ 会处理 stride
-            k_cache[:, :token_num, :].copy_(k4[0])
-            v_cache[:, :token_num, :].copy_(v4[0])
+            # 存 RoPE **之后**的 K；v4 是 permute 出来的 view，两条路径都会处理 stride
+            if block_table is None:
+                # 整块：逻辑位置 == 物理位置，一次连续拷贝
+                k_cache[:, :token_num, :].copy_(k4[0])
+                v_cache[:, :token_num, :].copy_(v4[0])
+            else:
+                # paged：逻辑上相邻的 token 可能落在物理上不相邻的页，必须 scatter
+                paged_kv_fill(k_cache, v_cache, k4[0], v4[0], block_table)
 
         if trace is not None:
             trace[f"{tag}.q_proj_q"] = q_raw
@@ -313,6 +323,7 @@ class Qwen35Runner:
         v_cache: torch.Tensor,
         pos: torch.Tensor,
         scratch,
+        block_table: torch.Tensor | None = None,
     ):
         nh, nkv, d = (
             self.w.num_attention_heads,
@@ -345,15 +356,20 @@ class Qwen35Runner:
 
         # 存进 cache 的必须是 RoPE **之后**的 K——历史 token 的 position 不会变，
         # 每步重新旋转是错的。
-        ctx = call_gqa_attention_decode_split_triton(
-            q4[0, :, 0, :].contiguous(),
-            k4[0, :, 0, :].contiguous(),
-            v_raw.view(nkv, d).contiguous(),
-            k_cache,
-            v_cache,
-            pos,
-            scratch,
-        )  # [H_q, D]
+        q_new = q4[0, :, 0, :].contiguous()
+        k_new = k4[0, :, 0, :].contiguous()
+        v_new = v_raw.view(nkv, d).contiguous()
+        if block_table is None:
+            ctx = call_gqa_attention_decode_split_triton(
+                q_new, k_new, v_new, k_cache, v_cache, pos, scratch
+            )  # [H_q, D]
+        else:
+            # 两条路径的在线 softmax 和 split-K 归约完全一样，只有 K/V 的寻址不同。
+            # paged 版把追加从两次 index_copy_（12 个算子、23.5us）换成了一个专用
+            # kernel（1.6us），所以整条路反而比整块快。
+            ctx = call_paged_gqa_attention_decode_triton(
+                q_new, k_new, v_new, k_cache, v_cache, block_table, pos, scratch
+            )  # [H_q, D]
 
         # T=1 时 pack 退化成逐元素乘 + 重排，仍复用 prefill 那个 kernel
         gate4 = gate.view(1, 1, nh, d).permute(0, 2, 1, 3)  # [1,H,1,D]
@@ -388,6 +404,7 @@ class Qwen35Runner:
                     caches.v_caches[i],
                     caches.pos,
                     caches.split_scratch,
+                    caches.block_table,   # None 时走整块路径
                 )
             x = residual_add(h, residual)
 
@@ -471,6 +488,7 @@ class Qwen35Runner:
                     h, layer, pos, inner, tag,
                     fill=None if caches is None
                     else (caches.k_caches[i], caches.v_caches[i]),
+                    block_table=None if caches is None else caches.block_table,
                 )
             x = residual_add(h, residual)
 
@@ -535,6 +553,11 @@ class Qwen35Runner:
         assert token_num <= caches.max_len, (
             f"prompt 长度 {token_num} 超出 cache 容量 {caches.max_len}"
         )
+        # paged 下必须在写之前把页要够。这里一次要满整个 cache 容量而不是只要
+        # token_num 页：decode 阶段在 CUDA Graph 里跑，host 没机会在两次 replay
+        # 之间插入分配（能插，但要维护影子计数器），一次要够最省事。
+        # 真正需要按步扩页的是 continuous batching，那时请求长度事先未知。
+        caches.reserve(caches.max_len)
         pos = self._positions(token_num)
         hidden = self._forward(input_ids, pos, None, None, caches=caches)
         # 位置推进到"已缓存 token_num 个"，下一个 decode 写在下标 token_num
