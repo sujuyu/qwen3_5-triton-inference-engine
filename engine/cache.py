@@ -40,14 +40,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from engine.loader import AttnLayerWeights, GDNLayerWeights, TextWeights
 from engine.paging import PagePool, SequencePages
 from triton_kernels.depthwise_causal_conv4_decode import CONV_KERNEL_SIZE
-from triton_kernels.gqa_attention_decode import (
-    allocate_kv_cache,
-    allocate_position,
-    allocate_split_scratch,
-)
+from triton_kernels.gqa_attention_decode import allocate_kv_cache
 from triton_kernels.gqa_attention_decode_paged import (
     PAGE_SIZE,
     allocate_paged_kv_cache,
+    allocate_split_scratch,
 )
 
 
@@ -55,19 +52,26 @@ from triton_kernels.gqa_attention_decode_paged import (
 class DecodeCaches:
     """一次生成过程中的全部可变状态。"""
 
-    # 位置：已缓存的 token 数。KV cache 的写入下标 + attention 的 seq_len 来源。
-    pos: torch.Tensor  # [1] INT64，显存
+    # 位置：每条序列已缓存的 token 数。KV cache 的写入下标 + attention 的
+    # seq_len 来源。batch 下每条序列各自推进，所以是 [B] 而不是标量。
+    pos: torch.Tensor  # [B] INT64，显存
 
     # 按层号索引；非对应类型的层为 None，这样层号可以直接当下标用
-    conv_states: list[torch.Tensor | None]  # GDN: [4, 6144] BF16
-    recurrent_states: list[torch.Tensor | None]  # GDN: [16,128,128] FP32
-    k_caches: list[torch.Tensor | None]  # attn: [2, T_max, 256] BF16
+    # GDN 的两个状态是**每条序列独立的**，而且不能分页——[16,128,128] 是稠密
+    # 矩阵，没有「按需分配」的余地。每条序列 18.84 MiB（18 层合计），与序列长度
+    # 无关，B=32 时就是 603 MiB。短序列时它比 KV cache 还大：交叉点在 804 token。
+    conv_states: list[torch.Tensor | None]  # GDN: [B, 4, 6144] BF16
+    recurrent_states: list[torch.Tensor | None]  # GDN: [B, 16,128,128] FP32
+    # paged: [num_pages, 2, 16, 256]，**所有序列共用一份**，靠 block_table 区分
+    # 整块: [2, T_max, 256]，只支持 B=1
+    k_caches: list[torch.Tensor | None]
     v_caches: list[torch.Tensor | None]
 
     # split-K 的 scratch，所有 attention 层共用一份（串行执行，用完即弃）
     split_scratch: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 
     max_len: int
+    batch: int = 1
 
     # ---- paged 专用；整块方案下都是 None ----
     #
@@ -95,7 +99,7 @@ class DecodeCaches:
             f"需要 {token_num} 个 token 的容量，超出 cache 上限 {self.max_len}"
         )
         if self.pages is not None:
-            self.pages.reserve(token_num, self.page_pool)
+            self.pages.reserve_all(token_num, self.page_pool)
 
     def reset(self) -> None:
         """清空全部状态。换 prompt、或 CUDA Graph 捕获之后必须调用。
@@ -128,7 +132,9 @@ class DecodeCaches:
         }
 
 
-def allocate_caches(w: TextWeights, max_len: int, *, paged: bool = False) -> DecodeCaches:
+def allocate_caches(
+    w: TextWeights, max_len: int, *, paged: bool = False, batch: int = 1
+) -> DecodeCaches:
     """按层类型分配三类 cache。一次分配，整个生成过程复用。
 
     `paged=True` 时 attention 的 KV 改用分页布局。**batch=1 下它没有任何显存收益**
@@ -138,13 +144,23 @@ def allocate_caches(w: TextWeights, max_len: int, *, paged: bool = False) -> Dec
 
     GDN 的两个 cache 与 paged 无关：它们是定长的，和上下文长度没关系。
     """
+    assert batch == 1 or paged, (
+        "batch > 1 必须配 paged=True：整块 KV cache 是 [H, T_max, D] 的单序列布局，"
+        "而且它的 decode kernel 断言 pos.numel() == 1。整块那条路保留为 B=1 的对拍基准。"
+    )
     device = w.device
     conv_dim = w.linear_num_heads * w.linear_head_dim * 3  # q+k+v = 6144
 
-    # 页数按 max_len 算，再留一页余量给「最后一个 token 正好落在新页开头」的情况
-    num_pages = (max_len + PAGE_SIZE - 1) // PAGE_SIZE + 1
+    # 页数按「每条序列 max_len」× batch 算，再留一点余量。
+    # 这里仍是按上限预留，没有兑现 paged「按实际用量取」的收益——因为 decode 在
+    # CUDA Graph 里跑，一次要够最省事。真正的收益要到 continuous batching：
+    # 请求长度事先未知、陆续到达时，池子才会被多条序列动态瓜分。
+    pages_per_seq = (max_len + PAGE_SIZE - 1) // PAGE_SIZE + 1
+    num_pages = pages_per_seq * batch
     pool = PagePool(num_pages) if paged else None
-    pages = SequencePages(num_pages, device=device) if paged else None
+    pages = (
+        SequencePages(pages_per_seq, batch=batch, device=device) if paged else None
+    )
 
     conv_states: list[torch.Tensor | None] = []
     recurrent_states: list[torch.Tensor | None] = []
@@ -155,12 +171,14 @@ def allocate_caches(w: TextWeights, max_len: int, *, paged: bool = False) -> Dec
         if isinstance(layer, GDNLayerWeights):
             conv_states.append(
                 torch.zeros(
-                    (CONV_KERNEL_SIZE, conv_dim), dtype=torch.bfloat16, device=device
+                    (batch, CONV_KERNEL_SIZE, conv_dim),
+                    dtype=torch.bfloat16,
+                    device=device,
                 )
             )
             recurrent_states.append(
                 torch.zeros(
-                    (w.linear_num_heads, w.linear_head_dim, w.linear_head_dim),
+                    (batch, w.linear_num_heads, w.linear_head_dim, w.linear_head_dim),
                     dtype=torch.float32,  # delta rule 的状态必须 FP32
                     device=device,
                 )
@@ -184,15 +202,16 @@ def allocate_caches(w: TextWeights, max_len: int, *, paged: bool = False) -> Dec
             v_caches.append(v)
 
     return DecodeCaches(
-        pos=allocate_position(device),
+        pos=torch.zeros(batch, dtype=torch.int64, device=device),
         conv_states=conv_states,
         recurrent_states=recurrent_states,
         k_caches=k_caches,
         v_caches=v_caches,
         split_scratch=allocate_split_scratch(
-            w.num_attention_heads, w.head_dim, device=device
+            w.num_attention_heads, w.head_dim, batch=batch, device=device
         ),
         max_len=max_len,
+        batch=batch,
         pages=pages,
         page_pool=pool,
     )

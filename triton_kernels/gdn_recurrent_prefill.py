@@ -147,45 +147,55 @@ def _gdn_recurrent_decode_kernel(
     out_ptr,
     stride_o_t: tl.constexpr, stride_o_h: tl.constexpr, stride_o_d: tl.constexpr,
 
-    state_ptr,
+    state_ptr,   # [B,H,DK,DV] FP32，原地更新
+    stride_state_b: tl.constexpr,
     stride_state_h: tl.constexpr,
     stride_state_dk: tl.constexpr,
     stride_state_dv: tl.constexpr,
 
     H: tl.constexpr, DK: tl.constexpr, DV: tl.constexpr,
     BLOCK_V: tl.constexpr,
-    DECODE_TOKEN_IDX: tl.constexpr = 0,
 ):
-    # decode 输入的 token 维恒定为 1；kernel 内按 [H, D] 索引第 0 个 token。
-    pid_h, pid_v = tl.program_id(0), tl.program_id(1)
+    # grid = (B, H, DV/BLOCK_V)。
+    #
+    # decode 时每条序列恰好贡献一个 token，所以**输入的 token 维直接当 batch 用**
+    # ——原来这里写死 `DECODE_TOKEN_IDX = 0` 取第 0 个 token，现在换成 pid_b 取第
+    # b 条序列的那一个。q/k/v/beta/g 的形状从 [1,H,D] 变成 [B,H,D]，
+    # stride 名字里的 `_t` 现在含义是 batch，为了少改代码没有重命名。
+    #
+    # state 则必须真的加一维：[B,H,DK,DV]。它是每条序列独立的递推状态，
+    # **而且不能分页**——[16,128,128] 是稠密矩阵，没有「按需分配」的余地。
+    # 每条序列 18.84 MiB（18 层合计），与序列长度无关，B=32 时就是 603 MiB。
+    pid_b, pid_h, pid_v = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     offset_dv = pid_v * BLOCK_V + tl.arange(0, BLOCK_V)
     offset_dk = tl.arange(0, DK)
 
     s = tl.load(
         state_ptr
+        + pid_b * stride_state_b
         + pid_h * stride_state_h
         + offset_dk[:, None] * stride_state_dk
         + offset_dv[None, :] * stride_state_dv
     ).to(tl.float32)
 
     g = tl.load(
-        g_ptr + DECODE_TOKEN_IDX * stride_g_t + pid_h * stride_g_h
+        g_ptr + pid_b * stride_g_t + pid_h * stride_g_h
     ).to(tl.float32)
     s = tl.exp(g) * s
     k = tl.load(
         k_ptr
-        + DECODE_TOKEN_IDX * stride_k_t
+        + pid_b * stride_k_t
         + pid_h * stride_k_h
         + offset_dk * stride_k_d
     ).to(tl.float32)
     memory = tl.sum(k[:, None] * s, axis=0)
 
     beta = tl.load(
-        beta_ptr + DECODE_TOKEN_IDX * stride_beta_t + pid_h * stride_beta_h
+        beta_ptr + pid_b * stride_beta_t + pid_h * stride_beta_h
     ).to(tl.float32)
     v = tl.load(
         v_ptr
-        + DECODE_TOKEN_IDX * stride_v_t
+        + pid_b * stride_v_t
         + pid_h * stride_v_h
         + offset_dv * stride_v_d
     ).to(tl.float32)
@@ -194,20 +204,21 @@ def _gdn_recurrent_decode_kernel(
 
     q = tl.load(
         q_ptr
-        + DECODE_TOKEN_IDX * stride_q_t
+        + pid_b * stride_q_t
         + pid_h * stride_q_h
         + offset_dk * stride_q_d
     ).to(tl.float32)
     out = tl.sum(q[:, None] * s, axis=0)
     tl.store(
         out_ptr
-        + DECODE_TOKEN_IDX * stride_o_t
+        + pid_b * stride_o_t
         + pid_h * stride_o_h
         + offset_dv * stride_o_d,
         out,
     )
     tl.store(
         state_ptr
+        + pid_b * stride_state_b
         + pid_h * stride_state_h
         + offset_dk[:, None] * stride_state_dk
         + offset_dv[None, :] * stride_state_dv,
@@ -1133,10 +1144,11 @@ def gdn_recurrent_decode(
     g: torch.Tensor,
     state: torch.Tensor,
 ) -> torch.Tensor:
+    # q/k/v 的第一维是 batch：decode 时每条序列恰好一个 token，
+    # 所以原来的 token 维直接当 batch 用，形状不变、含义变了。
     assert q.ndim == 3 and k.ndim == 3 and v.ndim == 3
     assert q.shape == k.shape
     assert q.shape[:2] == v.shape[:2]
-    assert q.shape[0] == 1
     assert beta.ndim == 2 and g.ndim == 2
     assert beta.shape == g.shape == q.shape[:2]
     assert q.dtype == torch.bfloat16
@@ -1146,9 +1158,13 @@ def gdn_recurrent_decode(
     assert state.dtype == torch.float32
     assert q.device == k.device == v.device == beta.device == g.device == state.device
 
-    _, num_heads, key_dim = q.shape
+    batch, num_heads, key_dim = q.shape
     value_dim = v.shape[-1]
-    assert state.shape == (num_heads, key_dim, value_dim)
+    # state 必须真的加一维——它是每条序列独立的递推状态
+    assert state.shape == (batch, num_heads, key_dim, value_dim), (
+        f"state 应为 [B,H,DK,DV]={(batch, num_heads, key_dim, value_dim)}，"
+        f"实际 {tuple(state.shape)}"
+    )
     assert triton.next_power_of_2(key_dim) == key_dim
     # All autotune candidates divide value_dim, so no DV mask is needed.
     assert value_dim % 128 == 0
@@ -1156,7 +1172,7 @@ def gdn_recurrent_decode(
     out = torch.empty_like(v)
 
     def grid(meta):
-        return (num_heads, value_dim // meta["BLOCK_V"])
+        return (batch, num_heads, value_dim // meta["BLOCK_V"])
 
     torch.library.wrap_triton(_gdn_recurrent_decode_kernel)[grid](
         q_ptr=q,
@@ -1182,9 +1198,10 @@ def gdn_recurrent_decode(
         stride_o_h=out.stride(1),
         stride_o_d=out.stride(2),
         state_ptr=state,
-        stride_state_h=state.stride(0),
-        stride_state_dk=state.stride(1),
-        stride_state_dv=state.stride(2),
+        stride_state_b=state.stride(0),
+        stride_state_h=state.stride(1),
+        stride_state_dk=state.stride(2),
+        stride_state_dv=state.stride(3),
         H=num_heads,
         DK=key_dim,
         DV=value_dim,
@@ -1555,6 +1572,8 @@ if __name__ == "__main__":
         beta[:prefix_tokens],
         g[:prefix_tokens],
     )
+    # decode kernel 现在带 batch 维（每条序列一份独立的递推状态），自测用 B=1
+    decode_state = decode_state.unsqueeze(0).contiguous()
     actual_parts = [prefix_out]
     for token_idx in range(prefix_tokens, q.shape[0]):
         actual_parts.append(
@@ -1571,6 +1590,7 @@ if __name__ == "__main__":
     decode_out_error = (
         actual_full_out.float() - expected_full_out.float()
     ).abs().max().item()
+    decode_state = decode_state[0]
     decode_state_error = (decode_state - expected_final_state).abs().max().item()
 
     torch.testing.assert_close(actual_full_out, expected_full_out, rtol=1e-2, atol=1e-2)

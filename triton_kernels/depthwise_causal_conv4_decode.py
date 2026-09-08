@@ -84,22 +84,30 @@ autotune_configs = [
 )
 @triton.jit
 def _depthwise_causal_conv4_decode_triton(
-    x_ptr,  # [1,D] BF16
+    x_ptr,  # [B,D] BF16
+    stride_x_b: tl.constexpr,
     stride_x_d: tl.constexpr,
-    state_ptr,  # [D,4] BF16，原地更新
+    state_ptr,  # [B,4,D] BF16，原地更新；每条序列一份独立状态
+    stride_state_b: tl.constexpr,
     stride_state_d: tl.constexpr,
     stride_state_k: tl.constexpr,
-    weight_ptr,  # [D,4] BF16
+    weight_ptr,  # [4,D] BF16，**所有序列共用**，不加 batch 偏移
     stride_w_d: tl.constexpr,
     stride_w_k: tl.constexpr,
-    out_ptr,  # [1,D] BF16
+    out_ptr,  # [B,D] BF16
+    stride_o_b: tl.constexpr,
     stride_o_d: tl.constexpr,
     D,
     K: tl.constexpr,  # = CONV_KERNEL_SIZE = 4
     BLOCK_D: tl.constexpr,
 ):
+    # grid = (B, cdiv(D, BLOCK_D))。batch 维只影响基址：conv state 是每条序列
+    # 独立的（各自的 x[t-3..t-1]），而 weight 是共用的。
+    pid_b, pid = tl.program_id(0), tl.program_id(1)
+    x_ptr = x_ptr + pid_b * stride_x_b
+    state_ptr = state_ptr + pid_b * stride_state_b
+    out_ptr = out_ptr + pid_b * stride_o_b
 
-    pid = tl.program_id(0)
     offset_d = pid * BLOCK_D + tl.arange(0, BLOCK_D)
     mask = offset_d < D
 
@@ -150,15 +158,16 @@ def depthwise_causal_conv4_decode(
     state: torch.Tensor,
     weight: torch.Tensor,
 ) -> torch.Tensor:
-    assert x.ndim == 2 and x.shape[0] == 1, "decode 每次只处理一个 token"
-    assert state.ndim == 2 and weight.ndim == 2
+    assert x.ndim == 2, "decode 每条序列一个 token，x 是 [B,D]"
+    assert state.ndim == 3 and weight.ndim == 2
     assert x.dtype == torch.bfloat16 and state.dtype == torch.bfloat16
     assert weight.dtype == torch.bfloat16
     assert x.device == state.device == weight.device
 
-    hidden_dim = x.shape[1]
-    assert state.shape == (CONV_KERNEL_SIZE, hidden_dim), (
-        f"state 应为 [4,D]={(CONV_KERNEL_SIZE, hidden_dim)}，实际 {tuple(state.shape)}"
+    batch, hidden_dim = x.shape
+    assert state.shape == (batch, CONV_KERNEL_SIZE, hidden_dim), (
+        f"state 应为 [B,4,D]={(batch, CONV_KERNEL_SIZE, hidden_dim)}，"
+        f"实际 {tuple(state.shape)}"
     )
     assert weight.shape == (CONV_KERNEL_SIZE, hidden_dim), (
         f"weight 应为 [4,D]={(CONV_KERNEL_SIZE, hidden_dim)}，实际 {tuple(weight.shape)}；"
@@ -167,27 +176,30 @@ def depthwise_causal_conv4_decode(
     # 必须是真正 contiguous 的 [4,D]。传 [D,4] 的转置 view 也能算出正确结果，
     # 但内存布局仍是 [D,4]，合并访问的好处全部消失（大 block 下慢 2.7 倍）。
     assert state.is_contiguous() and weight.is_contiguous(), (
-        "state/weight 必须是 contiguous 的 [4,D]，不能是 [D,4] 的转置 view——"
+        "state/weight 必须是 contiguous 的 [B,4,D] / [4,D]，不能是 [D,4] 的转置 view——"
         "那样访存不合并，本 kernel 换布局的意义就没了"
     )
 
     out = torch.empty_like(x)
 
     def grid(meta):
-        return (triton.cdiv(hidden_dim, meta["BLOCK_D"]),)
+        return (batch, triton.cdiv(hidden_dim, meta["BLOCK_D"]))
 
     torch.library.wrap_triton(_depthwise_causal_conv4_decode_triton)[grid](
         x_ptr=x,
+        stride_x_b=x.stride(0),
         stride_x_d=x.stride(1),
         state_ptr=state,
-        # [4,D] 布局：channel 维是连续的那一维，tap 维跨度为 D。
-        # kernel body 完全不用改，只是这两个 stride 的来源换了。
-        stride_state_d=state.stride(1),
-        stride_state_k=state.stride(0),
+        # [B,4,D] 布局：channel 维是连续的那一维，tap 维跨度为 D。
+        # kernel body 完全不用改，只是这几个 stride 的来源换了。
+        stride_state_b=state.stride(0),
+        stride_state_d=state.stride(2),
+        stride_state_k=state.stride(1),
         weight_ptr=weight,
         stride_w_d=weight.stride(1),
         stride_w_k=weight.stride(0),
         out_ptr=out,
+        stride_o_b=out.stride(0),
         stride_o_d=out.stride(1),
         D=hidden_dim,
         K=CONV_KERNEL_SIZE,
@@ -313,7 +325,8 @@ if __name__ == "__main__":
         expected = depthwise_causal_conv4_prefill(x, weight)
 
         weight_dec = conv_weight_for_decode(weight)
-        state = conv_state_from_prefill(x[:prefix])
+        # kernel 现在带 batch 维，自测用 B=1
+        state = conv_state_from_prefill(x[:prefix]).unsqueeze(0)  # [1,4,D]
         parts = [depthwise_causal_conv4_prefill(x[:prefix], weight)]
         for t in range(prefix, token_num):
             # 注意这个 op 会就地改写 state
@@ -341,9 +354,10 @@ if __name__ == "__main__":
         (CONV_KERNEL_SIZE, 1000), dtype=torch.bfloat16, device="cuda"
     )
     expected_out, expected_state = _torch_reference(x, state.clone(), weight)
-    actual_out = call_depthwise_causal_conv4_decode_triton(x, state, weight)
+    state_b = state.unsqueeze(0).contiguous()  # kernel 带 batch 维，这里 B=1
+    actual_out = call_depthwise_causal_conv4_decode_triton(x, state_b, weight)
     torch.testing.assert_close(actual_out, expected_out, rtol=2e-2, atol=2e-2)
-    torch.testing.assert_close(state, expected_state)
+    torch.testing.assert_close(state_b[0], expected_state)
     print("  D=1000 通用尺寸通过，且 state 已就地更新")
 
     # 转置 view 数值上也对，但布局仍是 [D,4]、访存不合并，必须被 assert 挡住
@@ -351,7 +365,7 @@ if __name__ == "__main__":
                       device="cuda").transpose(0, 1)
     assert bad.shape == (CONV_KERNEL_SIZE, 1000) and not bad.is_contiguous()
     try:
-        call_depthwise_causal_conv4_decode_triton(x, state, bad)
+        call_depthwise_causal_conv4_decode_triton(x, state_b, bad)
         raise SystemExit("转置 view 没有被 assert 挡住")
     except AssertionError:
         print("  转置 view 被正确拒绝")

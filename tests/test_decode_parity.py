@@ -254,6 +254,56 @@ def main() -> None:
     print(f"  页池：占用中 {paged_caches.page_pool.num_pages - free_before} 页 -> "
           f"reset 后全部归还 -> 复用结果一致 ✓")
 
+    # ---- 8. batch decode ------------------------------------------------
+    # 判据：B 条相同 prompt 一起跑，每条都必须等于 B=1 的结果。
+    #
+    # decode 的 batch 是**完全无交互**的：每条序列的 conv state、recurrent state、
+    # KV 页表、位置都各自独立，B 条只是恰好一起发射。所以逐条相同是可以严格要求的，
+    # 不像跨算法路径那样只能比噪声底。
+    #
+    # 反过来说，任何一处漏了 batch 下标都会在这里暴露——实际就抓到过两个：
+    # combine kernel 里 `seq_len = tl.load(pos_ptr)` 漏了 `+ pid_b`，
+    # 以及 lm_head_argmax 原本只读 hidden[T-1] 一行。
+    print("\n=== batch decode ===")
+    from engine.runner import GraphedDecoder as _GD
+    from triton_kernels.vocab_argmax import lm_head_argmax as _argmax
+
+    def run_batch(batch: int) -> list[list[int]]:
+        c = allocate_caches(runner.w, prompt_len + 24 + 32, paged=True, batch=batch)
+        try:
+            c.reset()
+            for b in range(batch):
+                runner.prefill(prompt, c, seq=b)
+            dec = _GD(runner, c)
+            dec.capture()  # 会把 cache 写脏
+            c.reset()
+            first = [
+                int(_argmax(runner.prefill(prompt, c, seq=b), runner.w.embed_tokens).item())
+                for b in range(batch)
+            ]
+            seqs = [[t] for t in first]
+            cur = first
+            for _ in range(15):
+                nxt = dec.step(cur if batch > 1 else cur[0])
+                cur = nxt if isinstance(nxt, list) else [nxt]
+                for b in range(batch):
+                    seqs[b].append(cur[b])
+            return seqs
+        finally:
+            del c
+            torch.cuda.empty_cache()
+
+    single = run_batch(1)[0]
+    print(f"  B=1 : {single[:8]} ...")
+    for batch in (2, 4):
+        outs = run_batch(batch)
+        for b, seq in enumerate(outs):
+            assert seq == single, (
+                f"B={batch} 的第 {b} 条与 B=1 不一致，首个分叉在第 "
+                f"{next(i for i, (x, y) in enumerate(zip(seq, single)) if x != y)} 个 token"
+            )
+        print(f"  B={batch} : {len(outs)} 条全部与 B=1 逐 token 相同 ✓")
+
     print("\nAll decode parity tests passed.")
 
 

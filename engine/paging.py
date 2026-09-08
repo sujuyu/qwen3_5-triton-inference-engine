@@ -53,9 +53,9 @@ from triton_kernels.gqa_attention_decode_paged import PAGE_SIZE
 
 
 def allocate_block_table(
-    max_pages: int, *, device: torch.device | str = "cuda"
+    max_pages: int, *, batch: int = 1, device: torch.device | str = "cuda"
 ) -> torch.Tensor:
-    """`[max_pages]` INT32，逻辑页 -> 物理页。
+    """`[B, max_pages]` INT32，逻辑页 -> 物理页，一条序列一行。
 
     **必须在显存里，不能是 host 侧的 list。** kernel 执行时才读它，
     所以 CUDA Graph 捕获之后 host 仍然可以往里写新分配的页号，replay 会看到——
@@ -65,7 +65,7 @@ def allocate_block_table(
     很重要：kernel 里 `block_table_ptr + pid_b * stride_bt_b` 的 stride 才能是
     编译期常量；若每条 session 一张独立长度的表，就得传指针数组，多一层解引用。
     """
-    return torch.zeros(max_pages, dtype=torch.int32, device=device)
+    return torch.zeros((batch, max_pages), dtype=torch.int32, device=device)
 
 
 class PagePool:
@@ -104,39 +104,74 @@ class PagePool:
 
 
 class SequencePages:
-    """一条序列的页表。`block_table` 在显存，分配记录在 host。"""
+    """一批序列的页表。`block_table` 是 `[B, max_pages]` 的显存张量，分配记录在 host。
 
-    def __init__(self, max_pages: int, *, device: torch.device | str = "cuda"):
+    **一块显存、B 行，不是 B 个独立张量。** 原因是 CUDA Graph：图里烧的是地址，
+    必须固定一块；kernel 靠 grid 的 batch 维偏到自己那一行
+    （`block_table_ptr + pid_b * stride_bt_b`），stride 才能是编译期常量。
+    若每条序列一张独立长度的表，就得传指针数组，多一层解引用。
+
+    **页池只有一份，所有序列共用**（`k_cache`/`v_cache`）。这正是分页的意义：
+    B 条请求不再各自按 max_len 预留，而是共同从一个池子里按实际用量取。
+    """
+
+    def __init__(
+        self,
+        max_pages: int,
+        *,
+        batch: int = 1,
+        device: torch.device | str = "cuda",
+    ):
         self.max_pages = max_pages
-        self.block_table = allocate_block_table(max_pages, device=device)
-        self.pages: list[int] = []
+        self.batch = batch
+        self.block_table = allocate_block_table(max_pages, batch=batch, device=device)
+        # 每条序列各自持有的物理页号，host 侧
+        self.pages: list[list[int]] = [[] for _ in range(batch)]
 
-    def reserve(self, token_num: int, pool: PagePool) -> None:
-        """确保能放下 `token_num` 个 token，不够就从池里要页并写进页表。
+    def reserve(self, token_num: int, pool: PagePool, *, seq: int = 0) -> None:
+        """确保第 `seq` 条序列能放下 `token_num` 个 token，不够就从池里要页。
 
         可以反复调用，只补差额——所以既能在 prefill 时一次要够（预分配），
         也能在 decode 里每步调一次（按需扩），两种策略共用这一个入口。
+
+        **必须在会写到那个位置的 forward 之前调用。** 写完再发现越界就晚了：
+        越界写会在 device 上 assert，报错点离原因很远。
         """
         need = (token_num + PAGE_SIZE - 1) // PAGE_SIZE
         assert need <= self.max_pages, (
             f"{token_num} 个 token 需要 {need} 页，超出页表容量 {self.max_pages}"
         )
-        if need <= len(self.pages):
+        held = self.pages[seq]
+        if need <= len(held):
             return
-        new_pages = pool.alloc(need - len(self.pages))
+        new_pages = pool.alloc(need - len(held))
         # 只写新增的那一段。block_table 在显存里，kernel 执行时才读，
-        # 所以 CUDA Graph 捕获之后写它也是安全的。
-        self.block_table[len(self.pages) : need] = torch.tensor(
+        # 所以 CUDA Graph 捕获之后写它也是安全的——图里烧的只是地址。
+        self.block_table[seq, len(held) : need] = torch.tensor(
             new_pages, dtype=torch.int32, device=self.block_table.device
         )
-        self.pages.extend(new_pages)
+        held.extend(new_pages)
 
-    def release(self, pool: PagePool) -> None:
-        pool.free(self.pages)
-        self.pages = []
-        self.block_table.zero_()
+    def reserve_all(self, token_num: int, pool: PagePool) -> None:
+        """给所有序列都留够 `token_num`。B=1 或等长场景的便捷入口。"""
+        for seq in range(self.batch):
+            self.reserve(token_num, pool, seq=seq)
 
-    @property
-    def capacity(self) -> int:
-        """当前已分配的页能放下多少 token。"""
-        return len(self.pages) * PAGE_SIZE
+    def release(self, pool: PagePool, *, seq: int | None = None) -> None:
+        """归还页。`seq=None` 表示全部归还。
+
+        不需要清空页表——kernel 只遍历 `lp < cdiv(seq_len, PAGE)`，而 seq_len 来自
+        pos，pos 归零后残留的旧页号永远读不到。但页必须还，否则池子会漏。
+        """
+        targets = range(self.batch) if seq is None else [seq]
+        for b in targets:
+            pool.free(self.pages[b])
+            self.pages[b] = []
+        if seq is None:
+            self.block_table.zero_()
+        else:
+            self.block_table[seq].zero_()
+
+    def capacity(self, seq: int = 0) -> int:
+        """第 `seq` 条序列当前已分配的页能放下多少 token。"""
+        return len(self.pages[seq]) * PAGE_SIZE

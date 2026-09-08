@@ -294,26 +294,27 @@ class Qwen35Runner:
         # 四个投影共享同一个 h，合成一次 [8224,1024] 的 GEMV 再切开。
         # 切片在 M=1 下是连续的（长度为 1 的维不参与连续性判定），下游可以直接 view。
         # 切分点必须和 loader._fuse_rows 里的拼接顺序一致。
-        fused = gemm_2d(h, w.in_proj_fused)  # [1,8224]
-        qkv = fused[:, : 3 * key_dim]  # [1,6144]
-        z = fused[:, 3 * key_dim : 4 * key_dim]  # [1,2048]
-        a = fused[:, 4 * key_dim : 4 * key_dim + heads]  # [1,16]
-        b = fused[:, 4 * key_dim + heads :]  # [1,16]
+        batch = h.shape[0]
+        fused = gemm_2d(h, w.in_proj_fused)  # [B,8224]
+        qkv = fused[:, : 3 * key_dim]  # [B,6144]
+        z = fused[:, 3 * key_dim : 4 * key_dim]  # [B,2048]
+        a = fused[:, 4 * key_dim : 4 * key_dim + heads]  # [B,16]
+        b = fused[:, 4 * key_dim + heads :]  # [B,16]
 
         # conv_state 存的是 conv 的**输入**（in_proj_qkv 的输出），不是输出也不是
         # SiLU 之后的值。这个 op 会就地推进 state。权重要用 [4,D] 那份。
         conv = depthwise_causal_conv4_decode(qkv, conv_state, w.conv1d_decode)
 
-        q = conv[:, 0:key_dim].view(1, heads, head_dim)
-        k = conv[:, key_dim : 2 * key_dim].view(1, heads, head_dim)
-        v = conv[:, 2 * key_dim : 3 * key_dim].view(1, heads, head_dim)
+        q = conv[:, 0:key_dim].view(batch, heads, head_dim)
+        k = conv[:, key_dim : 2 * key_dim].view(batch, heads, head_dim)
+        v = conv[:, 2 * key_dim : 3 * key_dim].view(batch, heads, head_dim)
 
         q_n, k_n, beta, g = gdn_qk_norm_gates(q, k, a, b, w.a_log, w.dt_bias)
         # 同样就地推进 [16,128,128] 的 FP32 状态
         core = gdn_recurrent_decode(q_n, k_n, v, beta, g, recurrent_state)
 
-        normed = gdn_gated_rmsnorm(core, z.view(1, heads, head_dim), w.norm)
-        return gemm_2d(normed.view(1, key_dim), w.out_proj)
+        normed = gdn_gated_rmsnorm(core, z.view(batch, heads, head_dim), w.norm)
+        return gemm_2d(normed.view(batch, key_dim), w.out_proj)
 
     def _attention_decode(
         self,
@@ -334,35 +335,56 @@ class Qwen35Runner:
         # 同 _gdn_decode：四个投影共享 h，合成一次 [5120,1024] 的 GEMV。
         # 注意 q_raw/k_raw 随后要喂给 qwen_rmsnorm，那是全仓库唯一要求 contiguous
         # 的 kernel——M=1 时切片仍然连续，所以这里成立；prefill 路径不能这么做。
-        fused = gemm_2d(h, w.qkvg_fused)  # [1,5120]
+        batch = h.shape[0]
+        fused = gemm_2d(h, w.qkvg_fused)  # [B,5120]
         qd, kd = nh * d, nkv * d
-        q_raw = fused[:, :qd]  # [1,2048]
-        gate = fused[:, qd : 2 * qd]  # [1,2048]
-        k_raw = fused[:, 2 * qd : 2 * qd + kd]  # [1,512]
-        v_raw = fused[:, 2 * qd + kd :]  # [1,512]
+        q_raw = fused[:, :qd]  # [B,2048]
+        gate = fused[:, qd : 2 * qd]  # [B,2048]
+        k_raw = fused[:, 2 * qd : 2 * qd + kd]  # [B,512]
+        v_raw = fused[:, 2 * qd + kd :]  # [B,512]
 
-        q = qwen_rmsnorm(q_raw.view(1, nh, d), w.q_norm, self.eps)
-        k = qwen_rmsnorm(k_raw.view(1, nkv, d), w.k_norm, self.eps)
+        # B=1 时切片仍然连续（长度为 1 的维不参与连续性判定），B>1 就不是了：
+        # fused 是 [B,5120]，切出的 [B,2048] stride 是 (5120,1)，view 成
+        # [B,8,256] 之后行间距不是单一值（同 batch 内隔 256，跨 batch 隔 5120），
+        # 而 qwen_rmsnorm 的 wrapper 把 x_stride_m 写死成 d_model。
+        #
+        # 这里用一次 contiguous 拷贝绕过去。代价是每层 2 次、24 层共 12 次额外
+        # kernel（[B,2048] BF16，B=4 才 16 KiB，纯启动开销约 4us/次）。
+        # 更好的做法是让 qwen_rmsnorm 收真实 stride、grid 加一维 batch，
+        # 那样一次拷贝都不用——kernel 本身已经是 stride-aware 的，只是 wrapper 没传。
+        q_rows = q_raw.view(batch, nh, d)
+        k_rows = k_raw.view(batch, nkv, d)
+        if batch > 1:
+            q_rows = q_rows.contiguous()
+            k_rows = k_rows.contiguous()
+        q = qwen_rmsnorm(q_rows, w.q_norm, self.eps)
+        k = qwen_rmsnorm(k_rows, w.k_norm, self.eps)
 
         # RoPE 的 position 就是 pos 本身（新 token 的下标 = 已缓存的数量）。
         # 传显存张量而不是 python int——CUDA Graph 下标量会被冻结。
-        pos_ids = pos.view(1, 1)
+        # 每条序列的位置不同，所以是 [B,1] 而不是标量广播
+        pos_ids = pos.view(batch, 1)
+        # [B,H,1,D]：把 batch 放回它该在的位置，token 维恒为 1
         q4 = partial_rope(
-            q.unsqueeze(0).permute(0, 2, 1, 3), pos_ids, self.inv_freq, self.w.rotary_dim
+            q.unsqueeze(2).permute(0, 1, 2, 3), pos_ids, self.inv_freq, self.w.rotary_dim
         )
         k4 = partial_rope(
-            k.unsqueeze(0).permute(0, 2, 1, 3), pos_ids, self.inv_freq, self.w.rotary_dim
+            k.unsqueeze(2).permute(0, 1, 2, 3), pos_ids, self.inv_freq, self.w.rotary_dim
         )
 
         # 存进 cache 的必须是 RoPE **之后**的 K——历史 token 的 position 不会变，
         # 每步重新旋转是错的。
-        q_new = q4[0, :, 0, :].contiguous()
-        k_new = k4[0, :, 0, :].contiguous()
-        v_new = v_raw.view(nkv, d).contiguous()
+        q_new = q4[:, :, 0, :].contiguous()  # [B,H_q,D]
+        k_new = k4[:, :, 0, :].contiguous()  # [B,H_kv,D]
+        v_new = v_raw.view(batch, nkv, d).contiguous()
         if block_table is None:
+            # 整块那条路只支持 B=1（它的 kernel 断言 pos.numel() == 1），
+            # 保留它作为对拍基准。这里把 batch 维摘掉再装回去。
+            assert batch == 1, "整块 KV cache 只支持 B=1，batch>1 请用 paged=True"
             ctx = call_gqa_attention_decode_split_triton(
-                q_new, k_new, v_new, k_cache, v_cache, pos, scratch
-            )  # [H_q, D]
+                q_new[0], k_new[0], v_new[0], k_cache, v_cache, pos,
+                tuple(t[0] for t in scratch),
+            ).unsqueeze(0)  # [1, H_q, D]
         else:
             # 两条路径的在线 softmax 和 split-K 归约完全一样，只有 K/V 的寻址不同。
             # paged 版把追加从两次 index_copy_（12 个算子、23.5us）换成了一个专用
@@ -371,9 +393,12 @@ class Qwen35Runner:
                 q_new, k_new, v_new, k_cache, v_cache, block_table, pos, scratch
             )  # [H_q, D]
 
-        # T=1 时 pack 退化成逐元素乘 + 重排，仍复用 prefill 那个 kernel
-        gate4 = gate.view(1, 1, nh, d).permute(0, 2, 1, 3)  # [1,H,1,D]
-        packed = attention_gate_pack(ctx.view(1, nh, 1, d), gate4)  # [1,2048]
+        # attention_gate_pack 的输出是 [token_num, H*D]，batch 维会被压掉。
+        # 但它只做逐元素乘 + 重排、**没有跨 token 的交互**，所以 decode 时
+        # 把 B 放进 token 那一维就行，kernel 一行不用改：[1, H, B, D] -> [B, H*D]。
+        gate4 = gate.view(batch, nh, d).permute(1, 0, 2).unsqueeze(0).contiguous()
+        ctx4 = ctx.permute(1, 0, 2).unsqueeze(0).contiguous()  # [1,H,B,D]
+        packed = attention_gate_pack(ctx4, gate4)  # [B,2048]
         return gemm_2d(packed, w.o_proj)
 
     def decode_step(
@@ -382,7 +407,12 @@ class Qwen35Runner:
         caches: DecodeCaches,
         trace: dict | None = None,
     ) -> torch.Tensor:
-        """单 token 前向。token_id: [1] int32；返回 final norm 之后的 [1,1024]。
+        """每条序列各推进一个 token。token_id: [B] int32；返回 [B,1024]。
+
+        batch 下唯一需要注意的是**没有任何跨序列交互**：每条序列的 conv state、
+        recurrent state、KV 页表、位置都是各自独立的，B 条只是恰好一起发射。
+        这也是为什么 decode 加 batch 维基本是机械改动——真正麻烦的是 prefill，
+        那里 Q 和 KV 两侧长度都不齐。
 
         **不推进 pos**——推进放在调用方（或 CUDA Graph 末尾），因为 attention
         需要"写入位置 = 当前 pos"，推进必须在整个 forward 之后。
@@ -460,6 +490,7 @@ class Qwen35Runner:
         trace: dict | None,
         trace_layers: set[int] | None,
         caches: DecodeCaches | None = None,
+        seq: int = 0,
     ) -> torch.Tensor:
         if trace_layers is None:
             trace_layers = {0, 3}
@@ -480,15 +511,19 @@ class Qwen35Runner:
             if isinstance(layer, GDNLayerWeights):
                 h = self._gdn(
                     h, layer, inner, tag,
+                    # 取第 seq 条序列那一片：conv_states[i] 是 [B,4,D]，
+                    # [seq] 之后正好是 prefill 版 _gdn 期望的 [4,D]
                     fill=None if caches is None
-                    else (caches.conv_states[i], caches.recurrent_states[i]),
+                    else (caches.conv_states[i][seq], caches.recurrent_states[i][seq]),
                 )
             else:
                 h = self._attention(
                     h, layer, pos, inner, tag,
+                    # KV 页池是所有序列共用的，不切；区分靠 block_table 的第 seq 行
                     fill=None if caches is None
                     else (caches.k_caches[i], caches.v_caches[i]),
-                    block_table=None if caches is None else caches.block_table,
+                    block_table=None if caches is None or not caches.paged
+                    else caches.block_table[seq],
                 )
             x = residual_add(h, residual)
 
@@ -540,8 +575,14 @@ class Qwen35Runner:
 
     # -------------------------------------------------- prefill + decode 路径
 
-    def prefill(self, input_ids: torch.Tensor, caches: DecodeCaches) -> torch.Tensor:
+    def prefill(
+        self, input_ids: torch.Tensor, caches: DecodeCaches, seq: int = 0
+    ) -> torch.Tensor:
         """整段 prefill，顺带把三类 cache 填好。返回 final norm 后的 [T,1024]。
+
+        `seq` 指定填 batch 里的哪一槽。**prefill 本身仍是单序列的**——B 条要调 B 次。
+        真正的 batch prefill 需要 cu_seqlens 打包（Q 和 KV 两侧长度都不齐），
+        是下一步的事；decode 才是吞吐的大头，prefill 只影响首 token 延迟。
 
         走的就是完整重算那条路径，只是每层多写一次 cache——所以 prefill 的数值
         与 `forward()` 完全一致，不需要额外对拍。
@@ -559,9 +600,10 @@ class Qwen35Runner:
         # 真正需要按步扩页的是 continuous batching，那时请求长度事先未知。
         caches.reserve(caches.max_len)
         pos = self._positions(token_num)
-        hidden = self._forward(input_ids, pos, None, None, caches=caches)
-        # 位置推进到"已缓存 token_num 个"，下一个 decode 写在下标 token_num
-        caches.pos.fill_(token_num)
+        hidden = self._forward(input_ids, pos, None, None, caches=caches, seq=seq)
+        # 位置推进到"已缓存 token_num 个"，下一个 decode 写在下标 token_num。
+        # 只动这一槽——其他序列各有各的进度。
+        caches.pos[seq] = token_num
         return hidden
 
     def generate_cached(
@@ -700,14 +742,20 @@ class GraphedDecoder:
         self.runner = runner
         self.caches = caches
         dev = runner.device
-        # 输入输出槽都在图外分配，地址固定；图只录它们的地址常量
-        self.tok_slot = torch.zeros(1, dtype=torch.int32, device=dev)
-        self.tok_out = torch.zeros((), dtype=torch.int64, device=dev)
+        self.batch = caches.batch
+        # 输入输出槽都在图外分配，地址固定；图只录它们的地址常量。
+        # batch 下形状是 [B]——**注意是 max_batch 而不是「当前活跃几条」**，
+        # 形状变了就得重新捕获，所以空闲槽位只能靠标记 + 早退来处理。
+        self.tok_slot = torch.zeros(self.batch, dtype=torch.int32, device=dev)
+        self.tok_out = torch.zeros(self.batch, dtype=torch.int64, device=dev)
         self.graph: torch.cuda.CUDAGraph | None = None
 
     def _one_step(self) -> None:
         hidden = self.runner.decode_step(self.tok_slot, self.caches)
-        self.tok_out.copy_(lm_head_argmax(hidden, self.runner.w.embed_tokens))
+        # last_only=False：hidden 是 [B,1024]，每条序列各出一个 token
+        self.tok_out.copy_(
+            lm_head_argmax(hidden, self.runner.w.embed_tokens, last_only=False)
+        )
         # pos 必须在 forward 之后推进：attention 要"写入位置 = 当前 pos"
         self.caches.pos.add_(1)
         self.tok_slot.copy_(self.tok_out)  # 闭环：本步输出即下步输入
@@ -730,13 +778,23 @@ class GraphedDecoder:
         with torch.cuda.graph(self.graph):
             self._one_step()
 
-    def step(self, prev_token: int | None = None) -> int:
-        """replay 一步。prev_token 传 None 表示沿用图内闭环写回的值。"""
+    def step(self, prev_token=None):
+        """replay 一步。prev_token 传 None 表示沿用图内闭环写回的值。
+
+        B=1 返回 int，B>1 返回长度 B 的 list。
+        """
         assert self.graph is not None, "先调用 capture()"
         if prev_token is not None:
-            self.tok_slot.fill_(prev_token)
+            if isinstance(prev_token, int):
+                self.tok_slot.fill_(prev_token)
+            else:
+                self.tok_slot.copy_(
+                    torch.as_tensor(
+                        prev_token, dtype=torch.int32, device=self.tok_slot.device
+                    )
+                )
         self.graph.replay()
-        return int(self.tok_out.item())
+        return int(self.tok_out[0].item()) if self.batch == 1 else self.tok_out.tolist()
 
 
 def build_runner(
