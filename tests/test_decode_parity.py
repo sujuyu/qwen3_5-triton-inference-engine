@@ -342,9 +342,18 @@ def main() -> None:
                 rel(c_pack.recurrent_states[0][b], c_one.recurrent_states[0][b])[1]
                 for b in range(batch)
             )
+            # conv state 由 conv_state_from_packed_prefill 一次写满 B 个槽, 而逐条
+            # 那边走 conv_state_from_prefill. 两条路径都是**纯搬运**(从 qkv 里挑
+            # 最后 4 行), 不做任何计算, 所以这里可以要求逐字节相等 -- 不像上面
+            # hidden 那样只能比噪声底. lengths=[7,100,1,64] 里那条长度为 1 的序列
+            # 顺带覆盖了 T<4 时"上方补零"的分支.
+            for b in range(batch):
+                assert torch.equal(
+                    c_pack.conv_states[0][b], c_one.conv_states[0][b]
+                ), f"第 {b} 条的 conv state 与逐条 prefill 不一致"
             print(
                 f"  lengths={str(lengths):<20} hidden rel={worst:.2e} "
-                f"gdn_state rel={st_err:.2e}  首 token 相同 ✓"
+                f"gdn_state rel={st_err:.2e}  conv_state 逐字节相同  首 token 相同 ✓"
             )
             assert worst < 0.05 and st_err < 0.05
         finally:

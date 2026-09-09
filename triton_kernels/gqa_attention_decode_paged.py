@@ -375,6 +375,219 @@ def paged_kv_fill(
     v_cache.view(-1, head_dim).index_copy_(0, flat_rows, v_prefill.reshape(-1, head_dim))
 
 
+# ------------------------------------------------------------------ varlen fill
+
+# BLOCK_T 钉死等于 PAGE_SIZE, 理由与 split kernel 相同(见模块 docstring):
+# 一个 tile 恰好落在一个页里, 页表只查一次而且查出来是标量.
+# 于是这里也只剩 warps 可调.
+paged_fill_varlen_autotune_configs = [
+    triton.Config({}, num_warps=w, num_stages=s)
+    for w in (1, 2, 4, 8)
+    for s in (1, 2)
+]
+
+
+@triton.autotune(
+    configs=paged_fill_varlen_autotune_configs,
+    key=["D", "H_KV", "T_BUCKET"],
+    # 和 `paged_kv_append` 同理: 目标地址与写入值全部由只读输入决定, 幂等,
+    # 所以 autotune 反复试 config 不会留下错误状态, 不需要 restore_value.
+    # wrapper 上的 mutates_args 仍然必须写 -- 那是给编译器看的, 与幂等无关.
+)
+@triton.jit
+def _paged_kv_fill_varlen_triton(
+    k_cache_ptr,  # [num_pages, H_kv, PAGE, D] BF16, 原地写
+    stride_kc_p: tl.constexpr,
+    stride_kc_h: tl.constexpr,
+    stride_kc_s: tl.constexpr,
+    stride_kc_d: tl.constexpr,
+    v_cache_ptr,  # [num_pages, H_kv, PAGE, D] BF16, 原地写
+    stride_vc_p: tl.constexpr,
+    stride_vc_h: tl.constexpr,
+    stride_vc_s: tl.constexpr,
+    stride_vc_d: tl.constexpr,
+    k_ptr,  # [H_kv, total_tokens, D] BF16, 打包后的一整条扁平序列
+    stride_k_h: tl.constexpr,
+    stride_k_t: tl.constexpr,
+    stride_k_d: tl.constexpr,
+    v_ptr,  # [H_kv, total_tokens, D] BF16
+    stride_v_h: tl.constexpr,
+    stride_v_t: tl.constexpr,
+    stride_v_d: tl.constexpr,
+    block_table_ptr,  # [B, max_pages] INT32, 一条序列一行
+    stride_bt_b: tl.constexpr,
+    cu_seqlens_ptr,  # [B+1] INT32, 打包偏移
+    PAGE: tl.constexpr,   # == BLOCK_T
+    D: tl.constexpr,
+    H_KV: tl.constexpr,
+    T_BUCKET: tl.constexpr,  # 只进 autotune key, kernel 里不用
+):
+    """把打包好的整段 K/V 按各自的页表散布进页池. grid = (B, H_kv, cdiv(max_seqlen, PAGE)).
+
+    一个 program 管**一条序列, 一个 KV head, 一个逻辑页**. 因为 BLOCK_T == PAGE,
+    这一个 tile 恰好就是页池里 `[phys, h]` 那块连续的 `[PAGE, D]`.
+
+    用 PyTorch 写出来是这几行(`b, h, lp` 是三个 program_id):
+
+        start = cu_seqlens[b]
+        n     = cu_seqlens[b + 1] - start        # 本条序列长度
+        if lp * PAGE >= n: return                # 超出本条长度的页, 直接退
+
+        phys  = block_table[b, lp]               # 物理页号, INT32 标量
+        slot  = arange(0, PAGE)                  # 页内槽位
+        t     = start + lp * PAGE + slot         # 打包缓冲里的全局行号
+        d     = arange(0, D)
+        m     = (lp * PAGE + slot) < n           # 尾页不满时的 mask, [PAGE]
+
+        k_cache[phys, h, slot, d] = k[h, t, d]   # 按 m[:, None] mask
+        v_cache[phys, h, slot, d] = v[h, t, d]
+
+    要点(前四条与 `paged_kv_append` 相同, 后三条是变长带来的):
+
+    1. **K 和 V 同一个 kernel. ** 地址算一次用两次.
+    2. **`phys` 提到 INT64 再参与地址运算**, 免得页数大时 `phys * stride_kc_p` 溢出.
+    3. **D 维不需要 mask.** head_dim=256 是 2 的幂, wrapper 里有断言兜底.
+    4. **k_cache / v_cache 不加 batch 偏移.** 页池所有序列共用, 区分靠 block_table 的行.
+    5. **T 维 load 和 store 都要 mask.** grid 按 `max_seqlen` 起, 短序列的尾页只有前
+       几个槽有效. load 漏了会读到隔壁序列的 token, store 漏了会覆盖掉本页尾部 --
+       而且因为页池是共用的, 错误不会越界崩溃, 只会静默算错.
+    6. **`seq_len` 是本条序列的长度, 不是打包总长.** 页表的逻辑页号从每条序列自己的 0
+       开始(`block_table[b]` 是这条序列私有的一行), 而 `t` 要的是打包缓冲里的全局行号,
+       两者差一个 `start`. **mask 里比的是局部位置 `lp*PAGE + slot`, 不是全局的 `t`. **
+    7. **超长的页整块 return.** 这就是变长打包在 scatter 侧的全部代价: grid 按最长的
+       那条起, 短序列多出来的 CTA 提前退出. 它们连一次 load 都不做, 退出成本约等于
+       启动成本.
+    """
+    pid_b, pid_h, pid_lp = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    start = tl.load(cu_seqlens_ptr + pid_b).to(tl.int32)
+    seq_len = tl.load(cu_seqlens_ptr + pid_b + 1).to(tl.int32) - start
+
+    if pid_lp * PAGE >= seq_len:
+        return
+
+    phys = tl.load(block_table_ptr + pid_b * stride_bt_b + pid_lp).to(tl.int64)
+
+    k_ptr = k_ptr + pid_h * stride_k_h + start * stride_k_t
+    v_ptr = v_ptr + pid_h * stride_v_h + start * stride_v_t
+
+    offset_d = tl.arange(0, D)
+
+    offset_t = pid_lp * PAGE + tl.arange(0, PAGE)
+    k = tl.load(k_ptr  + offset_t[:, None] * stride_k_t + offset_d[None, :] * stride_k_d, 
+            mask = offset_t[:, None] < seq_len, other = 0.0)
+    v = tl.load(v_ptr + offset_t[:, None] * stride_v_t + offset_d[None, :] * stride_v_d, 
+            mask = offset_t[:, None] < seq_len, other = 0.0)
+    tl.store(
+        k_cache_ptr + phys * stride_kc_p + pid_h * stride_kc_h\
+        + tl.arange(0, PAGE)[:, None] * stride_kc_s + offset_d[None, :] * stride_kc_d, 
+        k, mask = offset_t[:, None] < seq_len
+    )
+    tl.store(
+        v_cache_ptr + phys * stride_vc_p + pid_h * stride_vc_h\
+        + tl.arange(0, PAGE)[:, None] * stride_vc_s + offset_d[None, :] * stride_vc_d, 
+        v, mask = offset_t[:, None] < seq_len
+    )
+
+
+@torch.library.triton_op(
+    "wy_lib::paged_kv_fill_varlen", mutates_args=("k_cache", "v_cache")
+)
+def paged_kv_fill_varlen(
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    k_packed: torch.Tensor,
+    v_packed: torch.Tensor,
+    block_table: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    max_seqlen: int,
+) -> None:
+    """一次 kernel 把 B 条变长序列的 K/V 全部散布进页池.
+
+    替代"逐条调用 `paged_kv_fill`"那个循环. 后者每条要跑约 13 个算子
+    (`arange` + `physical_rows` 展开的一串逐元素 + `.t().reshape(-1)` 的物化 +
+    两次 `index_copy_`), 6 个 attention 层 x B 条, B=32 时约 2500 次发射 --
+    而 prefill 本来就是 CPU 分发受限的, 这部分被全额计入首 token 延迟.
+
+    `k_packed` / `v_packed` 形状 `[H_kv, total_tokens, D]`, 与逐条版本的
+    `[H, T, D]` 一致, 只是 T 换成了打包总长. 调用方传的是 permute 出来的 view,
+    所以三个 stride 都得如实传, 不能假设连续.
+    """
+    num_kv_heads, total_tokens, head_dim = k_packed.shape
+    assert v_packed.shape == k_packed.shape
+    assert k_cache.shape[1] == num_kv_heads and k_cache.shape[3] == head_dim
+    assert k_cache.shape[2] == PAGE_SIZE
+    assert v_cache.shape == k_cache.shape
+    assert k_cache.dtype == v_cache.dtype == torch.bfloat16
+    assert k_packed.dtype == v_packed.dtype == torch.bfloat16
+    assert block_table.dtype == torch.int32 and block_table.ndim == 2
+    assert cu_seqlens.dtype == torch.int32 and cu_seqlens.ndim == 1
+    batch = cu_seqlens.shape[0] - 1
+    assert block_table.shape[0] == batch, (
+        f"block_table 有 {block_table.shape[0]} 行, 但 cu_seqlens 说有 {batch} 条序列"
+    )
+    assert block_table.shape[1] >= triton.cdiv(max_seqlen, PAGE_SIZE), (
+        f"页表每行 {block_table.shape[1]} 页, 装不下最长的 {max_seqlen} 个 token"
+    )
+    assert triton.next_power_of_2(head_dim) == head_dim
+    assert triton.next_power_of_2(PAGE_SIZE) == PAGE_SIZE
+
+    grid = (batch, num_kv_heads, triton.cdiv(max_seqlen, PAGE_SIZE))
+    torch.library.wrap_triton(_paged_kv_fill_varlen_triton)[grid](
+        k_cache_ptr=k_cache,
+        stride_kc_p=k_cache.stride(0),
+        stride_kc_h=k_cache.stride(1),
+        stride_kc_s=k_cache.stride(2),
+        stride_kc_d=k_cache.stride(3),
+        v_cache_ptr=v_cache,
+        stride_vc_p=v_cache.stride(0),
+        stride_vc_h=v_cache.stride(1),
+        stride_vc_s=v_cache.stride(2),
+        stride_vc_d=v_cache.stride(3),
+        k_ptr=k_packed,
+        stride_k_h=k_packed.stride(0),
+        stride_k_t=k_packed.stride(1),
+        stride_k_d=k_packed.stride(2),
+        v_ptr=v_packed,
+        stride_v_h=v_packed.stride(0),
+        stride_v_t=v_packed.stride(1),
+        stride_v_d=v_packed.stride(2),
+        block_table_ptr=block_table,
+        stride_bt_b=block_table.stride(0),
+        cu_seqlens_ptr=cu_seqlens,
+        PAGE=PAGE_SIZE,
+        D=head_dim,
+        H_KV=num_kv_heads,
+        T_BUCKET=triton.next_power_of_2(max_seqlen),
+    )
+
+
+@torch.library.register_fake("wy_lib::paged_kv_fill_varlen")
+def _paged_kv_fill_varlen_fake(
+    k_cache, v_cache, k_packed, v_packed, block_table, cu_seqlens, max_seqlen
+) -> None:
+    return None
+
+
+def paged_kv_fill_varlen_torch(
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    k_packed: torch.Tensor,
+    v_packed: torch.Tensor,
+    block_table: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+) -> None:
+    """`paged_kv_fill_varlen` 的 PyTorch 版, **只用于对拍**.
+
+    就是现在 runner 里那个循环: 逐条切出自己那段, 调单序列的 `paged_kv_fill`.
+    """
+    offsets = cu_seqlens.tolist()
+    for b in range(len(offsets) - 1):
+        seg = slice(offsets[b], offsets[b + 1])
+        paged_kv_fill(
+            k_cache, v_cache, k_packed[:, seg, :], v_packed[:, seg, :], block_table[b]
+        )
+
+
 def allocate_split_scratch(
     num_q_heads: int,
     head_dim: int,
@@ -816,3 +1029,76 @@ def torch_paged_reference(
         probs = torch.softmax(scores, dim=-1)
         outs.append((probs.unsqueeze(1) @ v).squeeze(1))
     return torch.stack(outs).to(q.dtype)
+
+
+if __name__ == "__main__":
+    # 只自测 paged_kv_fill_varlen. 其余算子的对拍在 tests/test_decode_parity.py.
+    #
+    # 判据是**逐字节相等**: 这个 kernel 只搬运不计算, 不存在任何浮点误差余地.
+    # 有一点误差就是地址算错了.
+    H_KV, D = 2, 256
+    torch.manual_seed(0)
+
+    def run(lengths: list[int], *, shuffle: bool) -> None:
+        batch, total = len(lengths), sum(lengths)
+        max_len = max(lengths)
+        pages_per_seq = triton.cdiv(max_len, PAGE_SIZE)
+        num_pages = batch * pages_per_seq + 8  # 多几页, 保证不是刚好铺满
+
+        # **页表故意打乱**: 物理页顺序连续的话, "查了页表"和"没查页表"算出来的
+        # 地址是一样的, 测不出寻址错误. 这是这个测试最要紧的一处.
+        order = torch.randperm(num_pages) if shuffle else torch.arange(num_pages)
+        block_table = (
+            order[: batch * pages_per_seq]
+            .view(batch, pages_per_seq)
+            .to(torch.int32)
+            .cuda()
+            .contiguous()
+        )
+        cu = torch.tensor(
+            [0] + list(torch.tensor(lengths).cumsum(0)), dtype=torch.int32, device="cuda"
+        )
+
+        k_packed = torch.randn(H_KV, total, D, dtype=torch.bfloat16, device="cuda")
+        v_packed = torch.randn(H_KV, total, D, dtype=torch.bfloat16, device="cuda")
+
+        # 两份页池初值相同(非零, 这样"没写"和"写了零"能区分开)
+        init_k = torch.randn(num_pages, H_KV, PAGE_SIZE, D, dtype=torch.bfloat16, device="cuda")
+        init_v = torch.randn(num_pages, H_KV, PAGE_SIZE, D, dtype=torch.bfloat16, device="cuda")
+        kc_ref, vc_ref = init_k.clone(), init_v.clone()
+        kc_got, vc_got = init_k.clone(), init_v.clone()
+
+        paged_kv_fill_varlen_torch(kc_ref, vc_ref, k_packed, v_packed, block_table, cu)
+        paged_kv_fill_varlen(kc_got, vc_got, k_packed, v_packed, block_table, cu, max_len)
+
+        ok_k = torch.equal(kc_got, kc_ref)
+        ok_v = torch.equal(vc_got, vc_ref)
+        # 尾页里超出序列长度的槽位必须**原封不动** -- 这条单独查, 因为
+        # "多写了几行" 在上面的逐字节比较里也会暴露, 但报错信息说不清是哪种错.
+        untouched = torch.equal(
+            kc_got[order[batch * pages_per_seq :].cuda()],
+            init_k[order[batch * pages_per_seq :].cuda()],
+        )
+        tag = "打乱" if shuffle else "顺序"
+        flag = "ok" if (ok_k and ok_v and untouched) else "! 不一致"
+        print(
+            f"  lengths={str(lengths):<24} 页表{tag}  "
+            f"K={'=' if ok_k else 'X'} V={'=' if ok_v else 'X'} "
+            f"未分配页未被触碰={'是' if untouched else '否'}  {flag}"
+        )
+        assert ok_k and ok_v and untouched
+
+    print("=== paged_kv_fill_varlen vs 逐条 paged_kv_fill (逐字节) ===")
+    for lengths in (
+        [16],              # 恰好一页
+        [17],              # 尾页只有 1 个槽
+        [1],               # 极短
+        [16, 16],
+        [7, 100, 1, 64],   # 长度差异大, 短的那几条大量 CTA 提前退
+        [128] * 8,
+        [1, 1, 1, 1000],   # 最不均衡: grid 按 1000 起, 三条各只用 1 个槽
+    ):
+        run(lengths, shuffle=False)
+        run(lengths, shuffle=True)
+
+    print("\nAll paged_kv_fill_varlen tests passed.")

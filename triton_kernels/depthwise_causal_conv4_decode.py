@@ -239,6 +239,146 @@ def conv_state_from_prefill(x: torch.Tensor) -> torch.Tensor:
     return state
 
 
+# --------------------------------------------------- 打包 prefill 的 conv state
+
+# 与 decode kernel 共用一套 BLOCK_D 候选. 它们都是纯搬运的 memory-bound kernel,
+# 只是这个多一个 K=4 的行维. **所有候选都整除 D=6144**(= 2048 * 3), 所以下面
+# 不需要 D 维的 mask -- wrapper 里有断言兜底. 与 gdn_recurrent_prefill_sequential
+# 里 "All autotune candidates divide value_dim" 是同一个处理.
+conv_state_pack_autotune_configs = [
+    triton.Config({"BLOCK_D": bd}, num_warps=w, num_stages=1)
+    for bd, w in ((256, 4), (512, 4), (1024, 4), (1024, 8), (2048, 8))
+]
+
+
+@triton.autotune(
+    configs=conv_state_pack_autotune_configs,
+    key=["D"],
+    # **不需要 restore_value**, 尽管 state 是就地写的: 判据是幂等性.
+    # 这里纯粹是"从只读的 qkv 里挑几行抄进 state", 写一次和写一百次结果相同.
+    # 对比上面的 decode kernel, 那个是 state = f(state) 的读-改-写, 必须 restore.
+)
+@triton.jit
+def _conv_state_from_packed_prefill_triton(
+    x_ptr,  # [total_tokens, D] BF16, 打包后的 conv 输入(in_proj_qkv 的输出)
+    stride_x_t: tl.constexpr,
+    stride_x_d: tl.constexpr,
+    state_ptr,  # [B, K, D] BF16, 原地写
+    stride_state_b: tl.constexpr,
+    stride_state_k: tl.constexpr,
+    stride_state_d: tl.constexpr,
+    cu_seqlens_ptr,  # [B+1] INT32, 打包偏移
+    D: tl.constexpr,
+    K: tl.constexpr,  # = CONV_KERNEL_SIZE = 4
+    BLOCK_D: tl.constexpr,
+):
+    """一次抽出 B 条序列各自的末 K 行, 写进 decode 用的 conv state.
+
+    grid = (B, cdiv(D, BLOCK_D)), 一个 program 管一条序列的一段 channel.
+    用 PyTorch 写出来:
+
+        b, pid_d = program_id(0), program_id(1)
+        start = cu_seqlens[b]
+        end   = cu_seqlens[b + 1]
+
+        i = arange(0, K)              # 目标行号 0..3
+        t = end - K + i               # 源行号: 本条序列的最后 K 行
+        m = t >= start                # 长度不足 K 时, 上方那几行无效
+        d = pid_d * BLOCK_D + arange(0, BLOCK_D)
+
+        x = load(x[t, d], mask=m[:, None], other=0.0)   # [K, BLOCK_D]
+        state[b, i, d] = x
+
+    替代的是 `conv_state_from_prefill` 逐条调用: 那边每条要 3 个算子
+    (torch.zeros + 切片赋值 + 外面的 copy_), 18 个 GDN 层 x B 条, B=32 时约
+    1700 次发射 -- 而 prefill 是 CPU 分发受限的, 这部分全额计入首 token 延迟.
+
+    三个要点:
+
+    1. **store 不能带 `m` 的 mask.** 补零语义靠的是"load 时 other=0.0, store 时全写".
+       如果 store 也按 m mask 掉, 上方那几行就保留**上一轮的残留值**而不是零.
+       原来那个实现是靠 `torch.zeros` 保证的, 换成原地写之后这个保证就转移到了
+       store 上. 这个错误只在 T < K 且 cache 被复用时才显形, reset 之后第一次跑
+       不会暴露 -- 自测里专门有 lengths=[1] / [2,3] 这样的用例.
+
+    2. **补零补在上方**, 对应参考实现的 `F.pad(states, (padding_length, 0), value=0)`,
+       顺序不能反 -- 更新后 `state[:, c]` 必须恰好是 `x[t-3..t]`, decode kernel 的
+       点积才不用做下标偏移.
+
+    3. **`end - K + i` 会算出负数**(start=0, 序列长 1 时 t = -3..0). 有 mask 就不会
+       被解引用, 但要知道地址表达式本身是负的.
+
+    D 维不需要 mask, 理由见上面 autotune configs 的注释.
+    """
+    pid_b, pid_d = tl.program_id(0), tl.program_id(1)
+
+    offset_d = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
+
+    start = tl.load(cu_seqlens_ptr + pid_b).to(tl.int64)
+    seq_len = tl.load(cu_seqlens_ptr + pid_b + 1).to(tl.int64) - start
+
+    offset_t = start + seq_len - K + tl.arange(0, K)
+    valid_t = offset_t >= start 
+
+    x = tl.load(x_ptr + offset_t[:, None] * stride_x_t + offset_d[None, :] * stride_x_d, 
+            mask = valid_t[:, None], 
+            other = 0.0
+        )
+    tl.store(
+        state_ptr + pid_b * stride_state_b + tl.arange(0, K)[:, None] * stride_state_k + offset_d[None, :] * stride_state_d, x
+    )
+
+
+@torch.library.triton_op(
+    "wy_lib::conv_state_from_packed_prefill", mutates_args=("state",)
+)
+def conv_state_from_packed_prefill(
+    state: torch.Tensor,
+    x: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+) -> None:
+    """`conv_state_from_prefill` 的批量版, 直接写进 cache, 不返回新张量.
+
+    `cu_seqlens` 传 `[0, T]` 就退化成单序列, 所以非打包路径也能用 --
+    B=1 时同样把 3 次发射降到 1 次.
+    """
+    total_tokens, hidden_dim = x.shape
+    batch = cu_seqlens.shape[0] - 1
+    assert state.shape == (batch, CONV_KERNEL_SIZE, hidden_dim), (
+        f"state 形状 {tuple(state.shape)} 与 "
+        f"(B={batch}, K={CONV_KERNEL_SIZE}, D={hidden_dim}) 不符"
+    )
+    assert state.dtype == x.dtype
+    assert cu_seqlens.dtype == torch.int32 and cu_seqlens.ndim == 1
+    assert x.stride(1) == 1, "x 的 channel 维必须连续"
+    # 所有 BLOCK_D 候选都整除 D, kernel 里才能省掉 D 维的 mask
+    assert all(
+        hidden_dim % c.kwargs["BLOCK_D"] == 0
+        for c in conv_state_pack_autotune_configs
+    ), f"D={hidden_dim} 不能被全部 BLOCK_D 候选整除, kernel 里需要加 D 维 mask"
+
+    def grid(meta):
+        return (batch, triton.cdiv(hidden_dim, meta["BLOCK_D"]))
+
+    torch.library.wrap_triton(_conv_state_from_packed_prefill_triton)[grid](
+        x_ptr=x,
+        stride_x_t=x.stride(0),
+        stride_x_d=x.stride(1),
+        state_ptr=state,
+        stride_state_b=state.stride(0),
+        stride_state_k=state.stride(1),
+        stride_state_d=state.stride(2),
+        cu_seqlens_ptr=cu_seqlens,
+        D=hidden_dim,
+        K=CONV_KERNEL_SIZE,
+    )
+
+
+@torch.library.register_fake("wy_lib::conv_state_from_packed_prefill")
+def _conv_state_from_packed_prefill_fake(state, x, cu_seqlens) -> None:
+    return None
+
+
 def conv_weight_for_decode(weight: torch.Tensor) -> torch.Tensor:
     """checkpoint 的 [D,1,4] 或 [D,4] -> decode 用的 contiguous [4,D].
 
@@ -369,5 +509,30 @@ if __name__ == "__main__":
         raise SystemExit("转置 view 没有被 assert 挡住")
     except AssertionError:
         print("  转置 view 被正确拒绝")
+
+    # ---- 第 4 步: 打包版 conv state 抽取 ---------------------------------
+    # 判据是**逐字节相等**: 这个 kernel 只搬运不计算, 有一点差异就是下标算错了.
+    # 基准是逐条调用 conv_state_from_prefill, 也就是它替代掉的那个循环.
+    print("\n=== conv_state_from_packed_prefill vs 逐条 conv_state_from_prefill ===")
+    for lengths in ([19], [1], [2, 3], [4, 5], [7, 100, 1, 64], [128] * 8, [1, 1, 1, 1000]):
+        batch, total = len(lengths), sum(lengths)
+        x = torch.randn((total, 6144), dtype=torch.bfloat16, device="cuda")
+        cu = torch.tensor(
+            [0] + list(torch.tensor(lengths).cumsum(0)), dtype=torch.int32, device="cuda"
+        )
+        offsets = [0]
+        for n in lengths:
+            offsets.append(offsets[-1] + n)
+        ref = torch.stack(
+            [conv_state_from_prefill(x[offsets[b] : offsets[b + 1]]) for b in range(batch)]
+        )
+        # **初值故意非零**: T < 4 时上方要补零, 如果 kernel 漏写了那几行(比如给
+        # store 也加了 mask), 用零初值是看不出来的 -- 会和"补零"的正确结果重合.
+        got = torch.full((batch, CONV_KERNEL_SIZE, 6144), 7.0,
+                         dtype=torch.bfloat16, device="cuda")
+        conv_state_from_packed_prefill(got, x, cu)
+        ok = torch.equal(got, ref)
+        print(f"  lengths={str(lengths):<26} {'逐字节相同' if ok else '! 不一致'}")
+        assert ok, (got - ref).abs().max().item()
 
     print("All depthwise causal conv4 decode tests passed.")

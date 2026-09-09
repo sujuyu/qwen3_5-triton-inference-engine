@@ -90,14 +90,28 @@ one forward pass):
 
 ```
               one at a time    packed
-B=4  T=128          189ms        59ms    3.2x
-B=16 T=128          755ms       113ms    6.7x
+B=4  T=128          184ms        45ms    4.1x
+B=8  T=128          370ms        45ms    8.2x
+B=16 T=128          740ms        46ms   16.0x
+B=32 T=128         1475ms        61ms   24.3x
 ```
 
 What this saves is CPU-side operator dispatch, not GPU time: running prefill one
 prompt at a time costs about 367ms for both B=8/T=128 and B=8/T=512 (4x the tokens,
 same wall time) -- the cost is entirely "called it B times" multiplied by that ~43ms
 floor.
+
+Packing is only the first step. What makes it actually scale in B is removing
+three per-sequence Python loops: `int(cu_seqlens[seq])` inside `slice_of()` is a
+synchronizing DtoH copy, about 1600 of them per prefill at B=32, draining the
+pipeline over and over; scattering K/V into the page table cost roughly 13
+operators per sequence times 6 attention layers; and extracting the conv state
+cost 3 operators per sequence times 18 GDN layers. The latter two each became a
+kernel that takes `cu_seqlens` and fills all B slots in one launch.
+
+The launch count is now nearly flat in B -- 499 at B=1, 561 at B=32. Prefill at
+B=32 went from 209ms to 62ms, and at that point the GPU is busy for 57.9ms of a
+62.2ms wall clock: it is finally GPU-bound rather than waiting on dispatch.
 
 A decode step launches 349 kernels, of which the 96 GEMMs take about half the time.
 Each launch carries roughly 1.9us of irreducible cost even inside a CUDA graph, and
@@ -200,7 +214,7 @@ enabled automatically by `triton_kernels/__init__.py`.
 ## Layout
 
 ```
-triton_kernels/     17 files, 26 ops registered through torch.library
+triton_kernels/     17 files, 28 ops registered through torch.library
 engine/
   loader.py         safetensors loading + layout rearrangement (see below)
   cache.py          allocation and lifetime of the three cache types
@@ -223,7 +237,7 @@ kernels get contiguous memory:
 ### Kernel inventory
 
 <details>
-<summary>26 ops (click to expand)</summary>
+<summary>28 ops (click to expand)</summary>
 
 **General**
 `gemm_2d`, `qwen_rmsnorm`, `residual_add`, `swiglu`, `embedding_gather`, `lm_head_argmax`
@@ -237,11 +251,12 @@ kernels get contiguous memory:
 `gqa_attention_decode`, `gqa_attention_decode_split` + `gqa_attention_decode_combine`
 (flash-decoding style split-K),
 `paged_gqa_attention_decode_split` + `paged_gqa_attention_decode_combine` +
-`paged_kv_append` (paged KV, batched)
+`paged_kv_append` + `paged_kv_fill_varlen` (paged KV, batched)
 
 **Gated DeltaNet**
 `depthwise_causal_conv4_prefill`, `depthwise_causal_conv4_decode`, `gdn_qk_norm_gates`,
 `gdn_gated_rmsnorm`, `gdn_recurrent_prefill_sequential`, `gdn_recurrent_decode`,
+`conv_state_from_packed_prefill`,
 `gdn_chunk_prepare_wy` + `gdn_chunk_state` + `gdn_chunk_output` (chunk-64 parallel prefill)
 
 </details>

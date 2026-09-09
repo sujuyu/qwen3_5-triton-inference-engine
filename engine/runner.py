@@ -35,6 +35,7 @@ from triton_kernels.embedding_gather import embedding_gather
 from triton_kernels.gdn_gated_rmsnorm import gdn_gated_rmsnorm
 from triton_kernels.gdn_qk_norm_gates import gdn_qk_norm_gates
 from triton_kernels.depthwise_causal_conv4_decode import (
+    conv_state_from_packed_prefill,
     conv_state_from_prefill,
     depthwise_causal_conv4_decode,
 )
@@ -49,6 +50,7 @@ from triton_kernels.gqa_attention_decode import (
 from triton_kernels.gqa_attention_decode_paged import (
     call_paged_gqa_attention_decode_triton,
     paged_kv_fill,
+    paged_kv_fill_varlen,
 )
 from engine.cache import DecodeCaches, allocate_caches
 from triton_kernels.gemm_2d import gemm_2d
@@ -98,6 +100,7 @@ class PackedBatch:
     position_ids: torch.Tensor  # [1, total_tokens] INT32
     max_seqlen: int
     lengths: tuple[int, ...]
+    offsets: tuple[int, ...]    # [B+1] 与 cu_seqlens 同值, 但在 host 上
 
     @property
     def batch(self) -> int:
@@ -105,11 +108,20 @@ class PackedBatch:
 
     @property
     def total_tokens(self) -> int:
-        return int(self.cu_seqlens[-1])
+        return self.offsets[-1]
 
     def slice_of(self, seq: int) -> slice:
-        """第 seq 条序列在打包缓冲里的区间."""
-        return slice(int(self.cu_seqlens[seq]), int(self.cu_seqlens[seq + 1]))
+        """第 seq 条序列在打包缓冲里的区间.
+
+        **必须走 host 侧的 `offsets` 而不是 `int(cu_seqlens[seq])`**. 后者是一次
+        DtoH 拷贝, 而 DtoH 是同步的: CPU 要等 GPU 把已发射的 kernel 全部跑完才能
+        拿到那个 int. 这个函数在每个 GDN 层和每个 attention 层里按序列调一次,
+        B=32 时一次 prefill 就是约 1600 次 DtoH, 流水线被反复排干 ——
+        实测 CPU 发射耗时和墙钟**完全相等**(逐点小数位都一样), 就是这么来的.
+
+        cu_seqlens 那个 device 张量仍然要留着, 它是 kernel 的参数.
+        """
+        return slice(self.offsets[seq], self.offsets[seq + 1])
 
 
 def build_packed_batch(
@@ -132,6 +144,7 @@ def build_packed_batch(
         position_ids=position_ids,
         max_seqlen=max(lengths),
         lengths=tuple(lengths),
+        offsets=tuple(starts + [acc]),
     )
 
 
@@ -273,11 +286,10 @@ class Qwen35Runner:
                 recurrent_state.copy_(state)
             else:
                 # 递推状态 kernel 已经按序列分好了, 直接整块拷.
-                # conv state 要逐条取各自最后 4 行 -- 它们在打包缓冲里位置不同,
-                # 没法一次切出来. B 不大且 prefill 只跑一次, 循环可以接受.
+                # conv state 每条各取自己最后 4 行, 位置不同没法一次切出来,
+                # 所以把边界(cu_seqlens)传进 kernel, 一次发射写满 B 个槽.
                 recurrent_state.copy_(state)
-                for b in range(packed.batch):
-                    conv_state[b].copy_(conv_state_from_prefill(qkv[packed.slice_of(b)]))
+                conv_state_from_packed_prefill(conv_state, qkv, packed.cu_seqlens)
 
         if trace is not None:
             trace[f"{tag}.in_proj_qkv"] = qkv
@@ -363,13 +375,13 @@ class Qwen35Runner:
                 # paged: 逻辑上相邻的 token 可能落在物理上不相邻的页, 必须 scatter
                 paged_kv_fill(k_cache, v_cache, k4[0], v4[0], block_table)
             else:
-                # 打包: 每条序列有自己那一行页表, 逐条 scatter
-                for b in range(packed.batch):
-                    seg = packed.slice_of(b)
-                    paged_kv_fill(
-                        k_cache, v_cache,
-                        k4[0][:, seg, :], v4[0][:, seg, :], block_table[b],
-                    )
+                # 打包: 每条序列有自己那一行页表. 边界靠 cu_seqlens 传进 kernel,
+                # 一次发射搞定 B 条 -- 逐条循环的话每条约 13 个算子(physical_rows
+                # 会展开成一长串逐元素), 6 个 attention 层 x B 条全额计入首 token 延迟.
+                paged_kv_fill_varlen(
+                    k_cache, v_cache, k4[0], v4[0],
+                    block_table, packed.cu_seqlens, packed.max_seqlen,
+                )
 
         if trace is not None:
             trace[f"{tag}.q_proj_q"] = q_raw

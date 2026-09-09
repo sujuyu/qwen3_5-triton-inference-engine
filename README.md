@@ -76,13 +76,25 @@ batch 涨 32 倍而单步只涨 2.3 倍——权重读取被摊薄了 32 次，�
 
 ```
               逐条调用    打包一次
-B=4  T=128      189ms       59ms    3.2x
-B=16 T=128      755ms      113ms    6.7x
+B=4  T=128      184ms       45ms    4.1x
+B=8  T=128      370ms       45ms    8.2x
+B=16 T=128      740ms       46ms   16.0x
+B=32 T=128     1475ms       61ms   24.3x
 ```
 
 省的不是 GPU 时间而是 CPU 侧的算子分发：逐条 prefill 时 B=8/T=128 和
 B=8/T=512 都是约 367ms（token 数差 4 倍而耗时相同），成本全在「调了 B 次」
 乘以那个约 43ms 的地板上。
+
+打包本身只是第一步。真正让它随 B 扩展的，是把三处按序列的 Python 循环消掉：
+`slice_of()` 里 `int(cu_seqlens[seq])` 是一次同步的 DtoH，B=32 时一次 prefill
+就有约 1600 次，流水线被反复排干；把 K/V 散布进页表是每条约 13 个算子乘以
+6 个 attention 层；抽 conv state 是每条 3 个算子乘以 18 个 GDN 层。后两处各写了
+一个吃 `cu_seqlens` 的 kernel，一次发射写满 B 条。
+
+结果是 kernel 发射数几乎不再随 B 增长——B=1 是 499 次，B=32 是 561 次。
+B=32 的 prefill 从 209ms 降到 62ms，而且此时 GPU 忙 57.9ms、墙钟 62.2ms，
+终于变成 GPU-bound 而不是等 CPU 发射了。
 
 decode 一步 349 次 kernel 启动，其中 gemm 96 次占掉一半时间。图内每次启动有约
 1.9us 不可压缩的固定成本，加上 ramp-up 和 drain 合计约 4us，所以现在「让 kernel
@@ -193,7 +205,7 @@ kernel。结果会缓存到 `~/.triton/cache`，之后启动就只剩加载 1.4 
 ## 代码结构
 
 ```
-triton_kernels/     17 个文件，26 个通过 torch.library 注册的算子
+triton_kernels/     17 个文件，28 个通过 torch.library 注册的算子
 engine/
   loader.py         safetensors 权重加载，以及两处布局重排
   cache.py          三类缓存的分配和生命周期
@@ -214,7 +226,7 @@ tools/dump_oracle.py  生成参考张量，需要独立环境
 ### 算子清单
 
 <details>
-<summary>26 个算子（点击展开）</summary>
+<summary>28 个算子（点击展开）</summary>
 
 **通用**
 `gemm_2d`、`qwen_rmsnorm`、`residual_add`、`swiglu`、`embedding_gather`、`lm_head_argmax`
@@ -226,12 +238,13 @@ tools/dump_oracle.py  生成参考张量，需要独立环境
 **全注意力 · decode**
 `gqa_attention_decode`、`gqa_attention_decode_split` + `gqa_attention_decode_combine`
 （flash-decoding 风格的 split-K）、
-`paged_gqa_attention_decode_split` + `paged_gqa_attention_decode_combine` + `paged_kv_append`
-（分页 KV，支持 batch）
+`paged_gqa_attention_decode_split` + `paged_gqa_attention_decode_combine` +
+`paged_kv_append` + `paged_kv_fill_varlen`（分页 KV，支持 batch）
 
 **Gated DeltaNet**
 `depthwise_causal_conv4_prefill`、`depthwise_causal_conv4_decode`、`gdn_qk_norm_gates`、
 `gdn_gated_rmsnorm`、`gdn_recurrent_prefill_sequential`、`gdn_recurrent_decode`、
+`conv_state_from_packed_prefill`、
 `gdn_chunk_prepare_wy` + `gdn_chunk_state` + `gdn_chunk_output`（chunk-64 并行 prefill）
 
 </details>
