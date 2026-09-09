@@ -18,9 +18,9 @@ autotune_configs = [
     configs=autotune_configs,
     key=["N", "M_BUCKET"],
 )
-@triton.jit 
+@triton.jit
 def _swiglu_triton(
-    gate_ptr, 
+    gate_ptr,
     stride_gate_m, stride_gate_n,
     up_ptr,
     stride_up_m, stride_up_n,

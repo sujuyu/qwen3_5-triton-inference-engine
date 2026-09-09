@@ -16,7 +16,7 @@ autotune_configs = [
     configs=autotune_configs,
     key=["D", "T_BUCKET"],
 )
-@triton.jit 
+@triton.jit
 def _attention_gate_pack_kernel(
     x_ptr, # [B, H, T, D] BF16
     stride_x_b, stride_x_h, stride_x_t, stride_x_d,
@@ -24,7 +24,7 @@ def _attention_gate_pack_kernel(
     stride_gate_b, stride_gate_h, stride_gate_t, stride_gate_d,
     out_ptr, # [B*T, H*D] BF16
     stride_out_m, stride_out_n,
-    token_num: int, 
+    token_num: int,
     D: tl.constexpr,
     T_BUCKET: tl.constexpr,
     BLOCK_T: tl.constexpr,

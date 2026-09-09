@@ -22,7 +22,7 @@ def render_single_user_chat(prompt: str, enable_thinking: bool) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("prompt", nargs="?", default="你好，请简单介绍一下自己。")
+    parser.add_argument("prompt", nargs="?", default="你好, 请简单介绍一下自己.")
     parser.add_argument("--thinking", action="store_true")
     args = parser.parse_args()
 

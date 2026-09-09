@@ -1,12 +1,12 @@
-"""gemm_2d 在 runner 实际用到的全部尺寸上的正确性测试。
+"""gemm_2d 在 runner 实际用到的全部尺寸上的正确性测试.
 
-kernel 自带的自测只覆盖 (M,K,N)=(1,128,128)，而 runner 每一层都在用它。这里按真实
-投影尺寸补齐，独立成文件是为了不改动 triton_kernels/gemm_2d.py 本体。
+kernel 自带的自测只覆盖 (M,K,N)=(1,128,128), 而 runner 每一层都在用它. 这里按真实
+投影尺寸补齐, 独立成文件是为了不改动 triton_kernels/gemm_2d.py 本体.
 
     python tests/test_gemm_model_shapes.py
 
-reference 用 FP32 matmul。BF16 输入 + FP32 累加的结果与 FP32 参考的差异应在 BF16
-量级（相对误差 ~1%），这里按相对误差判定而非绝对值。
+reference 用 FP32 matmul. BF16 输入 + FP32 累加的结果与 FP32 参考的差异应在 BF16
+量级(相对误差 ~1%), 这里按相对误差判定而非绝对值.
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ sys.path.insert(0, str(ROOT))
 from triton_kernels.gemm_2d import gemm_2d
 
 
-# (K, N, 说明)——K 是 in_features，N 是 out_features，权重为 [N,K]。
+# (K, N, 说明) -- K 是 in_features, N 是 out_features, 权重为 [N,K].
 MODEL_SHAPES = [
     (1024, 16, "GDN in_proj_a / in_proj_b"),
     (1024, 512, "attn k_proj / v_proj"),
@@ -33,7 +33,7 @@ MODEL_SHAPES = [
     (3584, 1024, "MLP down_proj"),
 ]
 
-# T=1 是 decode，19 是 oracle 的 prompt 长度，65/129 跨过常见 tile 边界。
+# T=1 是 decode, 19 是 oracle 的 prompt 长度, 65/129 跨过常见 tile 边界.
 TOKEN_COUNTS = [1, 19, 65, 129]
 
 REL_TOL = 0.02
@@ -69,7 +69,7 @@ def main() -> None:
             )
 
     assert not failures, f"超容差: {failures}"
-    print(f"\n{len(MODEL_SHAPES) * len(TOKEN_COUNTS)} 组全部通过（相对容差 {REL_TOL:.0%}）。")
+    print(f"\n{len(MODEL_SHAPES) * len(TOKEN_COUNTS)} 组全部通过(相对容差 {REL_TOL:.0%}).")
 
 
 if __name__ == "__main__":

@@ -19,10 +19,10 @@ autotune_configs = [
 def _gdn_qk_norm_gates_kernel(
     q_ptr, # [T, 16, 128] BF16
     k_ptr, # [T, 16, 128] BF16
-    a, # [T, 16] BF16 
+    a, # [T, 16] BF16
     b, # [T, 16] BF16
     A_log, # [16] FP32
-    dt_bias, # [16] BF16 
+    dt_bias, # [16] BF16
 
     q_norm_ptr, # [T,16,128] BF16
     k_norm_ptr, # [T,16,128] BF16
@@ -56,7 +56,7 @@ def _gdn_qk_norm_gates_kernel(
 
     q = tl.load(
         q_ptr + offset_t[:, None, None] * stride_q_t + offset_h[None, :, None] * stride_q_h + offset_d[None, None, :] * stride_q_d,
-        mask=mask_t[:, None, None], 
+        mask=mask_t[:, None, None],
         other=0.0,
     ).to(tl.float32)
     k = tl.load(
@@ -69,8 +69,8 @@ def _gdn_qk_norm_gates_kernel(
     k_norm = k * tl.expand_dims(tl.rsqrt(tl.sum((k * k), axis=-1) + 1e-6), axis=-1)
 
     b = tl.load(
-        b + offset_t[:, None] * stride_b_t + offset_h * stride_b_h, 
-        mask = offset_t[:, None] < T, 
+        b + offset_t[:, None] * stride_b_t + offset_h * stride_b_h,
+        mask = offset_t[:, None] < T,
         other = 0.0
     ).to(tl.float32)
     beta = tl.sigmoid(b)
@@ -78,8 +78,8 @@ def _gdn_qk_norm_gates_kernel(
     a_log = tl.load(A_log + offset_h).to(tl.float32)
     dt_bias = tl.load(dt_bias + offset_h).to(tl.float32)
     a = tl.load(
-        a + offset_t[:, None] * stride_a_t + offset_h[None, :] * stride_a_h, 
-        mask = offset_t[:, None] < T, 
+        a + offset_t[:, None] * stride_a_t + offset_h[None, :] * stride_a_h,
+        mask = offset_t[:, None] < T,
         other = 0.0
     ).to(tl.float32)
     softplus_input = a + dt_bias[None, :]
@@ -91,25 +91,25 @@ def _gdn_qk_norm_gates_kernel(
     tl.store(
         q_norm_ptr + offset_t[:, None, None] * stride_q_norm_t +\
               offset_h[None, :, None] * stride_q_norm_h +\
-                  offset_d[None, None, :] * stride_q_norm_d, 
-        q_norm, 
+                  offset_d[None, None, :] * stride_q_norm_d,
+        q_norm,
         mask=mask_t[:, None, None]
     )
     tl.store(
         k_norm_ptr + offset_t[:, None, None] * stride_k_norm_t +\
               offset_h[None, :, None] * stride_k_norm_h +\
                   offset_d[None, None, :] * stride_k_norm_d,
-        k_norm, 
+        k_norm,
         mask = mask_t[:, None, None],
     )
     tl.store(
-        beta_ptr + offset_t[:, None] * stride_beta_t + offset_h * stride_beta_h, 
-        beta, 
+        beta_ptr + offset_t[:, None] * stride_beta_t + offset_h * stride_beta_h,
+        beta,
         mask = offset_t[:, None] < T
     )
     tl.store(
         g_ptr + offset_t[:, None] * stride_g_t + offset_h[None, :] * stride_g_h,
-        g, 
+        g,
         mask = offset_t[:, None] < T
     )
 

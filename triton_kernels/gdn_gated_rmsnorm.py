@@ -19,14 +19,14 @@ autotune_configs = [
 )
 @triton.jit
 def _gdn_gated_rmsnorm_triton(
-    x_ptr, 
-    stride_x_t: tl.constexpr, stride_x_h: tl.constexpr, stride_x_d: tl.constexpr, 
-    z_ptr, 
+    x_ptr,
+    stride_x_t: tl.constexpr, stride_x_h: tl.constexpr, stride_x_d: tl.constexpr,
+    z_ptr,
     stride_z_t: tl.constexpr, stride_z_h: tl.constexpr, stride_z_d: tl.constexpr,
     weight_ptr,
-    out_ptr, 
+    out_ptr,
     stride_o_t: tl.constexpr, stride_o_h: tl.constexpr, stride_o_d: tl.constexpr,
-    d_model: tl.constexpr, 
+    d_model: tl.constexpr,
     head_num: tl.constexpr,
     token_num,
     T_BUCKET: tl.constexpr,
@@ -41,13 +41,13 @@ def _gdn_gated_rmsnorm_triton(
     offset_d = tl.arange(0, d_model)
 
     x = tl.load(
-        x_ptr + offset_t[:, None] * stride_x_t + pid_h * stride_x_h + offset_d[None, :] * stride_x_d, 
-        mask = offset_t[:, None] < token_num, 
+        x_ptr + offset_t[:, None] * stride_x_t + pid_h * stride_x_h + offset_d[None, :] * stride_x_d,
+        mask = offset_t[:, None] < token_num,
         other = 0.0
     ).to(tl.float32)
     z = tl.load(
         z_ptr + offset_t[:, None] * stride_z_t + pid_h * stride_z_h + offset_d[None, :] * stride_z_d,
-        mask = offset_t[:, None] < token_num, 
+        mask = offset_t[:, None] < token_num,
         other = 0.0
     ).to(tl.float32)
 
@@ -58,18 +58,18 @@ def _gdn_gated_rmsnorm_triton(
 
     exp_neg_abs = tl.exp(-tl.abs(z))
     sigmoid_z = tl.where(
-        z >= 0, 
-        1.0 / (1.0 + exp_neg_abs), 
+        z >= 0,
+        1.0 / (1.0 + exp_neg_abs),
         exp_neg_abs / (1.0 + exp_neg_abs)
     )
     gate = z * sigmoid_z
 
     w = tl.load(weight_ptr + offset_d)
-    
+
     out =  normalized * w[None, :] * gate
 
     tl.store(
-        out_ptr + offset_t[:, None] * stride_o_t + pid_h * stride_o_h + offset_d[None, :] * stride_o_d, 
+        out_ptr + offset_t[:, None] * stride_o_t + pid_h * stride_o_h + offset_d[None, :] * stride_o_d,
         out,
         mask = offset_t[:, None] < token_num
     )

@@ -1,22 +1,22 @@
 """Gated DeltaNet recurrent prefill.
 
-Shapes（batch=1）：
+Shapes(batch=1):
     q, k:  [T, H, D_K]       beta, g: [T, H]
     v, out:[T, H, D_V]       state:   [H, D_K, D_V]
 
-固定 t、h：
+固定 t, h:
     S                              [D_K, D_V]
     memory = k[t,h] @ S            [D_V]
     delta = beta[t,h] * (v-memory) [D_V]
     S += outer(k[t,h], delta)      [D_K, D_V]
     out[t,h] = q[t,h] @ S          [D_V]
 
-分块：一个 CTA 负责一个 (head, v_tile)，持有：
+分块: 一个 CTA 负责一个 (head, v_tile), 持有:
     state tile:       [D_K, BLOCK_V]
     memory/delta/out: [BLOCK_V]
 
-每个 CTA 在 T 方向顺序循环。prefill 中不同 token 不能直接向量化并发；若要并行
-处理 T，需要改成 chunk/scan 算法。decode 使用缓存 state 且 T=1，只更新一次。
+每个 CTA 在 T 方向顺序循环. prefill 中不同 token 不能直接向量化并发; 若要并行
+处理 T, 需要改成 chunk/scan 算法. decode 使用缓存 state 且 T=1, 只更新一次.
 """
 
 import torch
@@ -48,27 +48,27 @@ decode_autotune_configs = [
     configs=sequential_autotune_configs,
     key=["H", "DK", "DV", "T_BUCKET"],
 )
-@triton.jit 
+@triton.jit
 def _gdn_recurrent_prefill_sequential_kernel(
-    q_ptr, 
+    q_ptr,
     stride_q_t: tl.constexpr, stride_q_h: tl.constexpr, stride_q_d: tl.constexpr,
 
-    k_ptr, 
+    k_ptr,
     stride_k_t: tl.constexpr, stride_k_h: tl.constexpr, stride_k_d: tl.constexpr,
 
-    v_ptr, 
+    v_ptr,
     stride_v_t: tl.constexpr, stride_v_h: tl.constexpr, stride_v_d: tl.constexpr,
 
-    beta_ptr, 
+    beta_ptr,
     stride_beta_t: tl.constexpr, stride_beta_h: tl.constexpr,
 
-    g_ptr, 
+    g_ptr,
     stride_g_t: tl.constexpr, stride_g_h: tl.constexpr,
 
-    out_ptr, 
+    out_ptr,
     stride_o_t: tl.constexpr, stride_o_h: tl.constexpr, stride_o_d: tl.constexpr,
 
-    state_ptr, 
+    state_ptr,
     stride_state_h: tl.constexpr,
     stride_state_dk: tl.constexpr,
     stride_state_dv: tl.constexpr,
@@ -118,7 +118,7 @@ def _gdn_recurrent_prefill_sequential_kernel(
             out
         )
     tl.store(
-        state_ptr + pid_h * stride_state_h + offset_dk[:, None] * stride_state_dk + offset_dv[None, :] * stride_state_dv, 
+        state_ptr + pid_h * stride_state_h + offset_dk[:, None] * stride_state_dk + offset_dv[None, :] * stride_state_dv,
         s
     )
 
@@ -147,7 +147,7 @@ def _gdn_recurrent_decode_kernel(
     out_ptr,
     stride_o_t: tl.constexpr, stride_o_h: tl.constexpr, stride_o_d: tl.constexpr,
 
-    state_ptr,   # [B,H,DK,DV] FP32，原地更新
+    state_ptr,   # [B,H,DK,DV] FP32, 原地更新
     stride_state_b: tl.constexpr,
     stride_state_h: tl.constexpr,
     stride_state_dk: tl.constexpr,
@@ -156,16 +156,16 @@ def _gdn_recurrent_decode_kernel(
     H: tl.constexpr, DK: tl.constexpr, DV: tl.constexpr,
     BLOCK_V: tl.constexpr,
 ):
-    # grid = (B, H, DV/BLOCK_V)。
+    # grid = (B, H, DV/BLOCK_V).
     #
-    # decode 时每条序列恰好贡献一个 token，所以**输入的 token 维直接当 batch 用**
-    # ——原来这里写死 `DECODE_TOKEN_IDX = 0` 取第 0 个 token，现在换成 pid_b 取第
-    # b 条序列的那一个。q/k/v/beta/g 的形状从 [1,H,D] 变成 [B,H,D]，
-    # stride 名字里的 `_t` 现在含义是 batch，为了少改代码没有重命名。
+    # decode 时每条序列恰好贡献一个 token, 所以**输入的 token 维直接当 batch 用**
+    # -- 原来这里写死 `DECODE_TOKEN_IDX = 0` 取第 0 个 token, 现在换成 pid_b 取第
+    # b 条序列的那一个. q/k/v/beta/g 的形状从 [1,H,D] 变成 [B,H,D],
+    # stride 名字里的 `_t` 现在含义是 batch, 为了少改代码没有重命名.
     #
-    # state 则必须真的加一维：[B,H,DK,DV]。它是每条序列独立的递推状态，
-    # **而且不能分页**——[16,128,128] 是稠密矩阵，没有「按需分配」的余地。
-    # 每条序列 18.84 MiB（18 层合计），与序列长度无关，B=32 时就是 603 MiB。
+    # state 则必须真的加一维: [B,H,DK,DV]. 它是每条序列独立的递推状态,
+    # **而且不能分页** -- [16,128,128] 是稠密矩阵, 没有"按需分配"的余地.
+    # 每条序列 18.84 MiB(18 层合计), 与序列长度无关, B=32 时就是 603 MiB.
     pid_b, pid_h, pid_v = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     offset_dv = pid_v * BLOCK_V + tl.arange(0, BLOCK_V)
     offset_dk = tl.arange(0, DK)
@@ -262,8 +262,8 @@ def _gdn_chunk_prepare_wy_kernel(
     stride_g_cumsum_h: tl.constexpr,
     stride_g_cumsum_c: tl.constexpr,
 
-    token_num: int, 
-    DK: tl.constexpr, DV: tl.constexpr, 
+    token_num: int,
+    DK: tl.constexpr, DV: tl.constexpr,
     BLOCK_T: tl.constexpr
 ):
     pid_chunk, pid_head = tl.program_id(0), tl.program_id(1)
@@ -273,8 +273,8 @@ def _gdn_chunk_prepare_wy_kernel(
     offset_dk = tl.arange(0, DK)
     offset_dv = tl.arange(0, DV)
 
-    # 与 chunk_output 同理：k 在显存里是 BF16，保留原 dtype 交给 tensor core，
-    # kkt 的结果与 FP32 ieee 点乘等价（BF16 乘积在 FP32 累加器里精确）。
+    # 与 chunk_output 同理: k 在显存里是 BF16, 保留原 dtype 交给 tensor core,
+    # kkt 的结果与 FP32 ieee 点乘等价(BF16 乘积在 FP32 累加器里精确).
     k_bf = tl.load(
         k_ptr + offset_token[:, None] * stride_k_t + pid_head * stride_k_h + offset_dk[None, :] * stride_k_d,
         mask = valid_token[:, None],
@@ -282,18 +282,18 @@ def _gdn_chunk_prepare_wy_kernel(
     )
     k = k_bf.to(tl.float32)
     v = tl.load(
-        v_ptr + offset_token[:, None] * stride_v_t + pid_head * stride_v_h + offset_dv[None, :] * stride_v_d, 
-        mask = valid_token[:, None], 
+        v_ptr + offset_token[:, None] * stride_v_t + pid_head * stride_v_h + offset_dv[None, :] * stride_v_d,
+        mask = valid_token[:, None],
         other = 0.0
     ).to(tl.float32)
     beta = tl.load(
-        beta_ptr + offset_token * stride_beta_t + pid_head * stride_beta_h, 
-        mask = valid_token, 
+        beta_ptr + offset_token * stride_beta_t + pid_head * stride_beta_h,
+        mask = valid_token,
         other = 0.0
     )
     g = tl.load(
-        g_ptr + offset_token * stride_g_t + pid_head * stride_g_h, 
-        mask = valid_token, 
+        g_ptr + offset_token * stride_g_t + pid_head * stride_g_h,
+        mask = valid_token,
         other = 0.0
     ).to(tl.float32)
 
@@ -302,7 +302,7 @@ def _gdn_chunk_prepare_wy_kernel(
     tl.store(
         g_cumsum_ptr + pid_chunk * stride_g_cumsum_n
         + pid_head * stride_g_cumsum_h
-        + offset_local * stride_g_cumsum_c, 
+        + offset_local * stride_g_cumsum_c,
         G
     )
 
@@ -327,7 +327,7 @@ def _gdn_chunk_prepare_wy_kernel(
     strict_lower = local_t > local_i
     gated_diff = tl.where(strict_lower & valid_pair, diff, -float("inf"))
 
-    kkt = tl.dot(k_bf, tl.trans(k_bf))  # 两边 BF16，精确
+    kkt = tl.dot(k_bf, tl.trans(k_bf))  # 两边 BF16, 精确
     lower = beta[:, None] * tl.exp(gated_diff) * kkt
     lower = tl.where(strict_lower & valid_pair, lower, 0.0)
 
@@ -349,9 +349,9 @@ def _gdn_chunk_prepare_wy_kernel(
         )
         inverse = tl.where(row_mask[:, None], inverse_row[None, :], inverse)
 
-    # inverse 和右端都是真 FP32，只能靠 tf32x3（三次 TF32 拼接近 FP32）。
-    # u_base/w 是后续两个 stage 的输入，误差会一路传到 final_state，
-    # 而 state 的判据是 5e-4——比 out 的 1e-2 严一个数量级，这里不能省。
+    # inverse 和右端都是真 FP32, 只能靠 tf32x3(三次 TF32 拼接近 FP32).
+    # u_base/w 是后续两个 stage 的输入, 误差会一路传到 final_state,
+    # 而 state 的判据是 5e-4 -- 比 out 的 1e-2 严一个数量级, 这里不能省.
     beta_v = beta[:, None] * v
     u_base = tl.dot(inverse, beta_v, input_precision="tf32x3")
 
@@ -375,10 +375,10 @@ def _gdn_chunk_prepare_wy_kernel(
         w,
     )
 
-    
 
 
-    
+
+
 
 
 @triton.jit
@@ -463,8 +463,8 @@ def _gdn_chunk_state_kernel(
             + offset_dv[None, :] * stride_u_d,
         ).to(tl.float32)
 
-        # w 和 state 都是真 FP32，且 state 是跨 chunk 累积的——误差会一路滚到
-        # final_state（decode 的初始状态）。判据 5e-4，用 tf32x3。
+        # w 和 state 都是真 FP32, 且 state 是跨 chunk 累积的 -- 误差会一路滚到
+        # final_state(decode 的初始状态). 判据 5e-4, 用 tf32x3.
         delta = u_base - tl.dot(w, state, input_precision="tf32x3")
         tl.store(
             delta_ptr
@@ -517,19 +517,19 @@ def _gdn_chunk_state_kernel(
     )
 
 
-# chunk_output 的 autotune 空间。
+# chunk_output 的 autotune 空间.
 #
-# 原先这里是写死的 `BLOCK_V=16, num_warps=4, num_stages=1`，代价有两层：
+# 原先这里是写死的 `BLOCK_V=16, num_warps=4, num_stages=1`, 代价有两层:
 #
-# 1. **N=16 的 tl.dot 几乎用不上 tensor core。** A100 的 MMA 最小 N 就是 16，
-#    跑在最小尺寸上流水线全是气泡。
-# 2. **更要命的是冗余。** grid 的 z 维是 DV/BLOCK_V = 128/16 = 8，而 kernel 里
-#    `q`、`k`、`qk = q @ k^T`、`exp(gated_diff)` 和因果掩码**都与 pid_v 无关**——
-#    8 个 CTA 把同一份 [64,64] 的 attention 矩阵各算了一遍。BLOCK_V 开到 128 时
-#    z 维为 1，这部分直接省掉 7/8。
+# 1. **N=16 的 tl.dot 几乎用不上 tensor core. ** A100 的 MMA 最小 N 就是 16,
+#    跑在最小尺寸上流水线全是气泡.
+# 2. **更要命的是冗余. ** grid 的 z 维是 DV/BLOCK_V = 128/16 = 8, 而 kernel 里
+#    `q`, `k`, `qk = q @ k^T`, `exp(gated_diff)` 和因果掩码**都与 pid_v 无关** --
+#    8 个 CTA 把同一份 [64,64] 的 attention 矩阵各算了一遍. BLOCK_V 开到 128 时
+#    z 维为 1, 这部分直接省掉 7/8.
 #
-# 一个 CTA 的活儿只取决于 (BLOCK_T, DK, DV)，与 token_num 无关（token_num 只改
-# grid 大小），所以 autotune key 里不需要 T——省掉一个分桶维度。
+# 一个 CTA 的活儿只取决于 (BLOCK_T, DK, DV), 与 token_num 无关(token_num 只改
+# grid 大小), 所以 autotune key 里不需要 T -- 省掉一个分桶维度.
 chunk_output_autotune_configs = [
     triton.Config({"BLOCK_V": bv}, num_warps=w, num_stages=s)
     for bv, w, s in [
@@ -591,11 +591,11 @@ def _gdn_chunk_output_kernel(
     offset_dk = tl.arange(0, DK)
     offset_dv = pid_v * BLOCK_V + tl.arange(0, BLOCK_V)
 
-    # q/k 在显存里就是 BF16。原先 load 完立刻 .to(tl.float32) 再配 ieee 做点乘，
-    # 等于用最慢的路径去算一份精度上并没有变好的结果——BF16 只有 7 位尾数，
-    # 提升到 FP32 不会凭空长出信息。这里保留 BF16 交给 tensor core：
-    # BF16×BF16 的乘积需要 16 位尾数，FP32 累加器（24 位）装得下，是**精确**的，
-    # 与 ieee FP32 点乘的差别只剩累加顺序。
+    # q/k 在显存里就是 BF16. 原先 load 完立刻 .to(tl.float32) 再配 ieee 做点乘,
+    # 等于用最慢的路径去算一份精度上并没有变好的结果 -- BF16 只有 7 位尾数,
+    # 提升到 FP32 不会凭空长出信息. 这里保留 BF16 交给 tensor core:
+    # BF16×BF16 的乘积需要 16 位尾数, FP32 累加器(24 位)装得下, 是**精确**的,
+    # 与 ieee FP32 点乘的差别只剩累加顺序.
     q_bf = tl.load(
         q_ptr
         + offset_token[:, None] * stride_q_t
@@ -634,12 +634,12 @@ def _gdn_chunk_output_kernel(
         + offset_local * stride_g_c,
     ).to(tl.float32)
 
-    # state_in 是 FP32。裸 TF32（10 位尾数）会把整体相对误差从 1.7e-3 推到 6.8e-3，
-    # 逼近 BF16 输出本身的量化底噪（2^-8 ≈ 3.9e-3），没有余量。tf32x3 用三次
-    # TF32 MMA 拼出接近 FP32 的精度，代价是 3 倍——但这个 kernel 修好 blocking
-    # 之后只剩 0.1ms，3 倍也无所谓。精度买回来更值。
+    # state_in 是 FP32. 裸 TF32(10 位尾数)会把整体相对误差从 1.7e-3 推到 6.8e-3,
+    # 逼近 BF16 输出本身的量化底噪(2^-8 ≈ 3.9e-3), 没有余量. tf32x3 用三次
+    # TF32 MMA 拼出接近 FP32 的精度, 代价是 3 倍 -- 但这个 kernel 修好 blocking
+    # 之后只剩 0.1ms, 3 倍也无所谓. 精度买回来更值.
     state_output = tl.dot(q, state_in)
-    qk = tl.dot(q_bf, tl.trans(k_bf))  # 两边都是 BF16，精确
+    qk = tl.dot(q_bf, tl.trans(k_bf))  # 两边都是 BF16, 精确
 
     local_t = offset_local[:, None]
     local_i = offset_local[None, :]
@@ -946,7 +946,7 @@ def gdn_chunk_output(
         device=q.device,
     )
 
-    # grid 的 z 维随 autotune 选中的 BLOCK_V 变，所以必须写成 meta 的函数
+    # grid 的 z 维随 autotune 选中的 BLOCK_V 变, 所以必须写成 meta 的函数
     def grid(meta):
         return (num_chunks, num_heads, triton.cdiv(value_dim, meta["BLOCK_V"]))
 
@@ -981,7 +981,7 @@ def gdn_chunk_output(
         DK=key_dim,
         DV=value_dim,
         BLOCK_T=chunk_size,
-        # BLOCK_V / num_warps / num_stages 由 autotune 提供，不在这里指定
+        # BLOCK_V / num_warps / num_stages 由 autotune 提供, 不在这里指定
     )
     return out
 
@@ -1144,8 +1144,8 @@ def gdn_recurrent_decode(
     g: torch.Tensor,
     state: torch.Tensor,
 ) -> torch.Tensor:
-    # q/k/v 的第一维是 batch：decode 时每条序列恰好一个 token，
-    # 所以原来的 token 维直接当 batch 用，形状不变、含义变了。
+    # q/k/v 的第一维是 batch: decode 时每条序列恰好一个 token,
+    # 所以原来的 token 维直接当 batch 用, 形状不变, 含义变了.
     assert q.ndim == 3 and k.ndim == 3 and v.ndim == 3
     assert q.shape == k.shape
     assert q.shape[:2] == v.shape[:2]
@@ -1160,9 +1160,9 @@ def gdn_recurrent_decode(
 
     batch, num_heads, key_dim = q.shape
     value_dim = v.shape[-1]
-    # state 必须真的加一维——它是每条序列独立的递推状态
+    # state 必须真的加一维 -- 它是每条序列独立的递推状态
     assert state.shape == (batch, num_heads, key_dim, value_dim), (
-        f"state 应为 [B,H,DK,DV]={(batch, num_heads, key_dim, value_dim)}，"
+        f"state 应为 [B,H,DK,DV]={(batch, num_heads, key_dim, value_dim)},"
         f"实际 {tuple(state.shape)}"
     )
     assert triton.next_power_of_2(key_dim) == key_dim
@@ -1319,8 +1319,8 @@ def _torch_chunk_prepare_wy_reference(
 
 
 def _test_gdn_chunk_prepare_wy() -> None:
-    # 长序列（>= 512）是后加的。原先只测到 129，也就是最多 3 个 chunk，
-    # 而误差是**沿 chunk 方向累积**的（state 一路滚下去），短序列看不出精度问题。
+    # 长序列(>= 512)是后加的. 原先只测到 129, 也就是最多 3 个 chunk,
+    # 而误差是**沿 chunk 方向累积**的(state 一路滚下去), 短序列看不出精度问题.
     test_cases = [1, 3, 63, 64, 65, 129, 512, 1025]
     num_heads, key_dim, value_dim = 16, 128, 128
 
@@ -1386,10 +1386,10 @@ def _test_gdn_chunk_prepare_wy() -> None:
 
 
 def _test_gdn_chunked_prefill() -> None:
-    # 同上：512/1025 覆盖 8 和 17 个 chunk，才能暴露沿 chunk 累积的误差。
-    # 这里的 k 必须是 L2 归一化的（模型里 gdn_qk_norm_gates 就是这么做的）——
-    # WY 变换要解 (I + tril(diag(beta)·KKᵀ)) 的三角系统，用未归一化的 k
-    # （‖k‖≈sqrt(DK)）会让 KKᵀ 的元素到 O(DK)，前向替换直接发散成 Inf/NaN。
+    # 同上: 512/1025 覆盖 8 和 17 个 chunk, 才能暴露沿 chunk 累积的误差.
+    # 这里的 k 必须是 L2 归一化的(模型里 gdn_qk_norm_gates 就是这么做的) --
+    # WY 变换要解 (I + tril(diag(beta)-KKᵀ)) 的三角系统, 用未归一化的 k
+    # (‖k‖≈sqrt(DK))会让 KKᵀ 的元素到 O(DK), 前向替换直接发散成 Inf/NaN.
     test_cases = [1, 3, 63, 64, 65, 129, 512, 1025]
     num_heads, key_dim, value_dim = 16, 128, 128
 
@@ -1572,7 +1572,7 @@ if __name__ == "__main__":
         beta[:prefix_tokens],
         g[:prefix_tokens],
     )
-    # decode kernel 现在带 batch 维（每条序列一份独立的递推状态），自测用 B=1
+    # decode kernel 现在带 batch 维(每条序列一份独立的递推状态), 自测用 B=1
     decode_state = decode_state.unsqueeze(0).contiguous()
     actual_parts = [prefix_out]
     for token_idx in range(prefix_tokens, q.shape[0]):

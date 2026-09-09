@@ -1,60 +1,60 @@
-"""Gated DeltaNet 的 depthwise causal Conv4 decode 版（单 token + conv state）。
+"""Gated DeltaNet 的 depthwise causal Conv4 decode 版(单 token + conv state).
 
 背景
 ----
-conv 的定义是 `y[t,c] = silu(sum_{r=0..3} w[c,r] * x[t+r-3, c])`，算 y[t] 要用到
-x[t-3..t]。decode 时只有 x[t] 是新的，前三个必须从 cache 取——这就是 conv state。
+conv 的定义是 `y[t,c] = silu(sum_{r=0..3} w[c,r] * x[t+r-3, c])`, 算 y[t] 要用到
+x[t-3..t]. decode 时只有 x[t] 是新的, 前三个必须从 cache 取 -- 这就是 conv state.
 
-注意它和 delta rule 的 recurrent state 是**两个独立的 cache**，GDN 每层都要：
+注意它和 delta rule 的 recurrent state 是**两个独立的 cache**, GDN 每层都要:
 
     conv state       [4,6144]     BF16   本文件维护
     recurrent state  [16,128,128] FP32   gdn_recurrent_decode 维护
 
-conv state 存的是 **conv 的输入**，也就是 `in_proj_qkv` 的输出，不是 conv 的输出，
-也不是 SiLU 之后的值。18 层合计只有 0.84 MiB。
+conv state 存的是 **conv 的输入**, 也就是 `in_proj_qkv` 的输出, 不是 conv 的输出,
+也不是 SiLU 之后的值. 18 层合计只有 0.84 MiB.
 
-约定与参考实现一致（transformers 的 `causal_conv1d_update`，state_len=conv_kernel_size=4）：
-更新后 `state[:,c]` 恰好是 `x[t-3..t]`，所以点积不用再做下标偏移。
+约定与参考实现一致(transformers 的 `causal_conv1d_update`, state_len=conv_kernel_size=4):
+更新后 `state[:,c]` 恰好是 `x[t-3..t]`, 所以点积不用再做下标偏移.
 
 接口
 ----
-    x:      [1,D] BF16      新 token 的 in_proj_qkv 输出，模型里 D=6144
-    state:  [4,D] BF16      原地更新，必须 contiguous
-    weight: [4,D] BF16      必须 contiguous，用 conv_weight_for_decode() 从
+    x:      [1,D] BF16      新 token 的 in_proj_qkv 输出, 模型里 D=6144
+    state:  [4,D] BF16      原地更新, 必须 contiguous
+    weight: [4,D] BF16      必须 contiguous, 用 conv_weight_for_decode() 从
                             checkpoint 的 [D,1,4] 转换
     out:    [1,D] BF16      含 SiLU
 
 运算
 ----
-    state[:,c] = concat(state[1:,c], x[c])      # 左移一格，新值放末尾
+    state[:,c] = concat(state[1:,c], x[c])      # 左移一格, 新值放末尾
     acc  = sum_{r=0..3} weight[r,c] * state[r,c]   # FP32 累加
     y[c] = acc * sigmoid(acc)                      # SiLU
 
 为什么是 [4,D] 而不是 [D,4]
 --------------------------
-kernel 里一个线程负责一个 channel。取第 k 个 tap 时：
+kernel 里一个线程负责一个 channel. 取第 k 个 tap 时:
 
-    [D,4]：线程 d 访问元素 d*4+k        —— 相邻线程相隔 4 个元素，非合并
-    [4,D]：线程 d 访问元素 k*D+d        —— 相邻线程地址连续，完全合并
+    [D,4]: 线程 d 访问元素 d*4+k -- 相邻线程相隔 4 个元素, 非合并
+    [4,D]: 线程 d 访问元素 k*D+d -- 相邻线程地址连续, 完全合并
 
-GPU 取显存的最小单位是 32 字节（16 个 BF16）。`[D,4]` 下这 16 个数只有 4 个是本次
-要用的（利用率 25%），`[4,D]` 下全部用上。A100 实测（CUDA Graph，D=6144）：
+GPU 取显存的最小单位是 32 字节(16 个 BF16).`[D,4]` 下这 16 个数只有 4 个是本次
+要用的(利用率 25%), `[4,D]` 下全部用上. A100 实测(CUDA Graph, D=6144):
 
     布局                      BLOCK=256   BLOCK=512   BLOCK=1024
     state[D,4] weight[D,4]     1.88us      2.48us      5.14us
     state[4,D] weight[D,4]     1.68us      1.95us      3.27us
     state[4,D] weight[4,D]     1.60us      1.69us      1.89us   ← 采用
 
-除了更快，[4,D] 对 BLOCK_D 几乎不敏感，autotune 才有实际选择空间；[D,4] 在大 block
-下退化严重，之前 autotune 总是选最小的 256 就是在补偿这一点。
+除了更快, [4,D] 对 BLOCK_D 几乎不敏感, autotune 才有实际选择空间; [D,4] 在大 block
+下退化严重, 之前 autotune 总是选最小的 256 就是在补偿这一点.
 
-**两个张量都必须是真正 contiguous 的 [4,D]，不能是 [D,4] 的转置 view**——转置 view
-的内存布局仍是 [D,4]，合并访问的好处全部消失。wrapper 里有 assert 挡着。
+**两个张量都必须是真正 contiguous 的 [4,D], 不能是 [D,4] 的转置 view** -- 转置 view
+的内存布局仍是 [D,4], 合并访问的好处全部消失. wrapper 里有 assert 挡着.
 
-decode 因此需要一份独立于 prefill 的权重副本（prefill 用 [D,1,4]）。代价是
-6144*4*2 bytes * 18 层 = 0.86 MiB，可以忽略。
+decode 因此需要一份独立于 prefill 的权重副本(prefill 用 [D,1,4]). 代价是
+6144*4*2 bytes * 18 层 = 0.86 MiB, 可以忽略.
 
-纯 memory-bound，一个 CTA 处理一段 channel 即可。
+纯 memory-bound, 一个 CTA 处理一段 channel 即可.
 """
 
 import torch
@@ -78,8 +78,8 @@ autotune_configs = [
 @triton.autotune(
     configs=autotune_configs,
     key=["D"],
-    # state 会被就地改写，不加这个的话 autotune 反复试 config 会把 state 推进多次。
-    # 与 gdn_recurrent_decode 同样的处理。
+    # state 会被就地改写, 不加这个的话 autotune 反复试 config 会把 state 推进多次.
+    # 与 gdn_recurrent_decode 同样的处理.
     restore_value=["state_ptr"],
 )
 @triton.jit
@@ -87,11 +87,11 @@ def _depthwise_causal_conv4_decode_triton(
     x_ptr,  # [B,D] BF16
     stride_x_b: tl.constexpr,
     stride_x_d: tl.constexpr,
-    state_ptr,  # [B,4,D] BF16，原地更新；每条序列一份独立状态
+    state_ptr,  # [B,4,D] BF16, 原地更新; 每条序列一份独立状态
     stride_state_b: tl.constexpr,
     stride_state_d: tl.constexpr,
     stride_state_k: tl.constexpr,
-    weight_ptr,  # [4,D] BF16，**所有序列共用**，不加 batch 偏移
+    weight_ptr,  # [4,D] BF16, **所有序列共用**, 不加 batch 偏移
     stride_w_d: tl.constexpr,
     stride_w_k: tl.constexpr,
     out_ptr,  # [B,D] BF16
@@ -101,8 +101,8 @@ def _depthwise_causal_conv4_decode_triton(
     K: tl.constexpr,  # = CONV_KERNEL_SIZE = 4
     BLOCK_D: tl.constexpr,
 ):
-    # grid = (B, cdiv(D, BLOCK_D))。batch 维只影响基址：conv state 是每条序列
-    # 独立的（各自的 x[t-3..t-1]），而 weight 是共用的。
+    # grid = (B, cdiv(D, BLOCK_D)). batch 维只影响基址: conv state 是每条序列
+    # 独立的(各自的 x[t-3..t-1]), 而 weight 是共用的.
     pid_b, pid = tl.program_id(0), tl.program_id(1)
     x_ptr = x_ptr + pid_b * stride_x_b
     state_ptr = state_ptr + pid_b * stride_state_b
@@ -121,10 +121,10 @@ def _depthwise_causal_conv4_decode_triton(
     w2 = tl.load(weight_ptr + offset_d * stride_w_d + 2 * stride_w_k, mask=mask, other=0.0).to(tl.float32)
     w3 = tl.load(weight_ptr + offset_d * stride_w_d + 3 * stride_w_k, mask=mask, other=0.0).to(tl.float32)
 
-    # 4 个 tap 的求和就在这一行里完成，acc 已经是 [BLOCK_D]，后面不要再 reduce
+    # 4 个 tap 的求和就在这一行里完成, acc 已经是 [BLOCK_D], 后面不要再 reduce
     acc = (s1 * w0 + s2 * w1 + s3 * w2 + x * w3)
 
-    # 写回state：读的下标比写的下标各大 1，就是左移一格
+    # 写回state: 读的下标比写的下标各大 1, 就是左移一格
     tl.store(
         state_ptr + offset_d * stride_state_d + 0 * stride_state_k,
         s1.to(tl.bfloat16), mask=mask
@@ -142,7 +142,7 @@ def _depthwise_causal_conv4_decode_triton(
         x.to(tl.bfloat16), mask=mask
     )
 
-    acc = acc * tl.sigmoid(acc) # SiLU，与 prefill 版写法一致；acc 已是 FP32
+    acc = acc * tl.sigmoid(acc) # SiLU, 与 prefill 版写法一致; acc 已是 FP32
 
     tl.store(
         out_ptr + offset_d * stride_o_d, acc.to(tl.bfloat16), mask=mask
@@ -158,7 +158,7 @@ def depthwise_causal_conv4_decode(
     state: torch.Tensor,
     weight: torch.Tensor,
 ) -> torch.Tensor:
-    assert x.ndim == 2, "decode 每条序列一个 token，x 是 [B,D]"
+    assert x.ndim == 2, "decode 每条序列一个 token, x 是 [B,D]"
     assert state.ndim == 3 and weight.ndim == 2
     assert x.dtype == torch.bfloat16 and state.dtype == torch.bfloat16
     assert weight.dtype == torch.bfloat16
@@ -166,18 +166,18 @@ def depthwise_causal_conv4_decode(
 
     batch, hidden_dim = x.shape
     assert state.shape == (batch, CONV_KERNEL_SIZE, hidden_dim), (
-        f"state 应为 [B,4,D]={(batch, CONV_KERNEL_SIZE, hidden_dim)}，"
+        f"state 应为 [B,4,D]={(batch, CONV_KERNEL_SIZE, hidden_dim)},"
         f"实际 {tuple(state.shape)}"
     )
     assert weight.shape == (CONV_KERNEL_SIZE, hidden_dim), (
-        f"weight 应为 [4,D]={(CONV_KERNEL_SIZE, hidden_dim)}，实际 {tuple(weight.shape)}；"
+        f"weight 应为 [4,D]={(CONV_KERNEL_SIZE, hidden_dim)}, 实际 {tuple(weight.shape)};"
         "用 conv_weight_for_decode() 从 checkpoint 的 [D,1,4] 转换"
     )
-    # 必须是真正 contiguous 的 [4,D]。传 [D,4] 的转置 view 也能算出正确结果，
-    # 但内存布局仍是 [D,4]，合并访问的好处全部消失（大 block 下慢 2.7 倍）。
+    # 必须是真正 contiguous 的 [4,D]. 传 [D,4] 的转置 view 也能算出正确结果,
+    # 但内存布局仍是 [D,4], 合并访问的好处全部消失(大 block 下慢 2.7 倍).
     assert state.is_contiguous() and weight.is_contiguous(), (
-        "state/weight 必须是 contiguous 的 [B,4,D] / [4,D]，不能是 [D,4] 的转置 view——"
-        "那样访存不合并，本 kernel 换布局的意义就没了"
+        "state/weight 必须是 contiguous 的 [B,4,D] / [4,D], 不能是 [D,4] 的转置 view -- "
+        "那样访存不合并, 本 kernel 换布局的意义就没了"
     )
 
     out = torch.empty_like(x)
@@ -190,8 +190,8 @@ def depthwise_causal_conv4_decode(
         stride_x_b=x.stride(0),
         stride_x_d=x.stride(1),
         state_ptr=state,
-        # [B,4,D] 布局：channel 维是连续的那一维，tap 维跨度为 D。
-        # kernel body 完全不用改，只是这几个 stride 的来源换了。
+        # [B,4,D] 布局: channel 维是连续的那一维, tap 维跨度为 D.
+        # kernel body 完全不用改, 只是这几个 stride 的来源换了.
         stride_state_b=state.stride(0),
         stride_state_d=state.stride(2),
         stride_state_k=state.stride(1),
@@ -225,10 +225,10 @@ def call_depthwise_causal_conv4_decode_triton(
 
 
 def conv_state_from_prefill(x: torch.Tensor) -> torch.Tensor:
-    """prefill 的 conv 输入 [T,D] -> decode 的初始 conv state [4,D]，contiguous。
+    """prefill 的 conv 输入 [T,D] -> decode 的初始 conv state [4,D], contiguous.
 
-    取最后 4 行；T < 4 时**上方**补零（对应原 [D,4] 布局的左侧），与参考实现的
-    `F.pad(states, (padding_length, 0), value=0)` 一致。
+    取最后 4 行; T < 4 时**上方**补零(对应原 [D,4] 布局的左侧), 与参考实现的
+    `F.pad(states, (padding_length, 0), value=0)` 一致.
     """
     token_num, hidden_dim = x.shape
     state = torch.zeros(
@@ -240,10 +240,10 @@ def conv_state_from_prefill(x: torch.Tensor) -> torch.Tensor:
 
 
 def conv_weight_for_decode(weight: torch.Tensor) -> torch.Tensor:
-    """checkpoint 的 [D,1,4] 或 [D,4] -> decode 用的 contiguous [4,D]。
+    """checkpoint 的 [D,1,4] 或 [D,4] -> decode 用的 contiguous [4,D].
 
-    必须 `.contiguous()`：转置 view 的内存布局仍是 [D,4]，访存不合并。
-    在权重加载时调一次即可，运行时零开销；18 层多占 0.86 MiB。
+    必须 `.contiguous()`: 转置 view 的内存布局仍是 [D,4], 访存不合并.
+    在权重加载时调一次即可, 运行时零开销; 18 层多占 0.86 MiB.
     """
     if weight.ndim == 3:
         weight = weight.squeeze(1)
@@ -256,11 +256,11 @@ def _torch_reference(
     state: torch.Tensor,
     weight: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """返回 (out, new_state)。参考实现不原地改 state，便于对拍时保留旧值。
+    """返回 (out, new_state). 参考实现不原地改 state, 便于对拍时保留旧值.
 
-    state/weight 均为 [4,D]。
+    state/weight 均为 [4,D].
     """
-    # 左移一格，新值放末尾；之后 new_state[:,c] 就是 x[t-3..t]
+    # 左移一格, 新值放末尾; 之后 new_state[:,c] 就是 x[t-3..t]
     new_state = torch.cat([state[1:], x], dim=0)
     acc = (new_state.float() * weight.float()).sum(dim=0)
     out = torch.nn.functional.silu(acc).to(x.dtype).unsqueeze(0)
@@ -279,9 +279,9 @@ if __name__ == "__main__":
     torch.manual_seed(0)
     hidden_dim = 6144
 
-    # ---- 第 1 步：先验证参考实现本身对不对 -------------------------------
-    # 判据是「prefill 前 n 个 token，拿 conv state，再逐 token decode 剩下的」
-    # 必须与整段 prefill 完全一致。这一步不依赖 Triton kernel，现在就能跑。
+    # ---- 第 1 步: 先验证参考实现本身对不对 -------------------------------
+    # 判据是"prefill 前 n 个 token, 拿 conv state, 再逐 token decode 剩下的"
+    # 必须与整段 prefill 完全一致. 这一步不依赖 Triton kernel, 现在就能跑.
     print("=== 参考实现 vs prefill kernel ===")
     for token_num, prefix in ((1, 0), (2, 1), (3, 1), (4, 2), (17, 5), (65, 33)):
         x = torch.randn(
@@ -309,9 +309,9 @@ if __name__ == "__main__":
         err = (actual.float() - expected.float()).abs().max().item()
         torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
         print(f"  T={token_num:>3} prefix={prefix:>2}  max_abs_error={err:.8f}")
-    print("参考实现与 prefill kernel 一致。\n")
+    print("参考实现与 prefill kernel 一致. \n")
 
-    # ---- 第 2 步：Triton kernel vs 参考实现 -------------------------------
+    # ---- 第 2 步: Triton kernel vs 参考实现 -------------------------------
     print("=== Triton kernel vs 参考实现 ===")
     for token_num, prefix in ((4, 2), (17, 5), (65, 33)):
         x = torch.randn(
@@ -325,7 +325,7 @@ if __name__ == "__main__":
         expected = depthwise_causal_conv4_prefill(x, weight)
 
         weight_dec = conv_weight_for_decode(weight)
-        # kernel 现在带 batch 维，自测用 B=1
+        # kernel 现在带 batch 维, 自测用 B=1
         state = conv_state_from_prefill(x[:prefix]).unsqueeze(0)  # [1,4,D]
         parts = [depthwise_causal_conv4_prefill(x[:prefix], weight)]
         for t in range(prefix, token_num):
@@ -345,7 +345,7 @@ if __name__ == "__main__":
             f"best_config={_depthwise_causal_conv4_decode_triton.best_config}"
         )
 
-    # 通用尺寸，确认没有把 D=6144 写死；顺带覆盖 D 不是 BLOCK_D 整数倍的 mask 路径
+    # 通用尺寸, 确认没有把 D=6144 写死; 顺带覆盖 D 不是 BLOCK_D 整数倍的 mask 路径
     x = torch.randn((1, 1000), dtype=torch.bfloat16, device="cuda")
     state = torch.randn(
         (CONV_KERNEL_SIZE, 1000), dtype=torch.bfloat16, device="cuda"
@@ -354,13 +354,13 @@ if __name__ == "__main__":
         (CONV_KERNEL_SIZE, 1000), dtype=torch.bfloat16, device="cuda"
     )
     expected_out, expected_state = _torch_reference(x, state.clone(), weight)
-    state_b = state.unsqueeze(0).contiguous()  # kernel 带 batch 维，这里 B=1
+    state_b = state.unsqueeze(0).contiguous()  # kernel 带 batch 维, 这里 B=1
     actual_out = call_depthwise_causal_conv4_decode_triton(x, state_b, weight)
     torch.testing.assert_close(actual_out, expected_out, rtol=2e-2, atol=2e-2)
     torch.testing.assert_close(state_b[0], expected_state)
-    print("  D=1000 通用尺寸通过，且 state 已就地更新")
+    print("  D=1000 通用尺寸通过, 且 state 已就地更新")
 
-    # 转置 view 数值上也对，但布局仍是 [D,4]、访存不合并，必须被 assert 挡住
+    # 转置 view 数值上也对, 但布局仍是 [D,4], 访存不合并, 必须被 assert 挡住
     bad = torch.randn((1000, CONV_KERNEL_SIZE), dtype=torch.bfloat16,
                       device="cuda").transpose(0, 1)
     assert bad.shape == (CONV_KERNEL_SIZE, 1000) and not bad.is_contiguous()

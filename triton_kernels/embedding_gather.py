@@ -18,12 +18,12 @@ autotune_configs = [
 )
 @triton.jit
 def _embedding_gather_triton(
-    input_ids_ptr, # [T] 
+    input_ids_ptr, # [T]
     weight_ptr, # [248320, 1024] BF16
-    stride_w: tl.constexpr, 
-    output_ptr, # [T, 1024], 
+    stride_w: tl.constexpr,
+    output_ptr, # [T, 1024],
     stride_o_t: tl.constexpr, stride_o_d: tl.constexpr,
-    d_model: tl.constexpr, # 1024 
+    d_model: tl.constexpr, # 1024
     token_num,
     T_BUCKET: tl.constexpr,
     BLOCK_T: tl.constexpr
@@ -33,18 +33,18 @@ def _embedding_gather_triton(
     offset_d = tl.arange(0, d_model)
 
     input_ids = tl.load(
-        input_ids_ptr + offset_t, 
-        mask = offset_t < token_num, 
+        input_ids_ptr + offset_t,
+        mask = offset_t < token_num,
         other = 0
     )
 
     w = tl.load(
-        weight_ptr + input_ids[:, None] * stride_w + offset_d[None, :], 
+        weight_ptr + input_ids[:, None] * stride_w + offset_d[None, :],
         mask = offset_t[:, None] < token_num)
 
     tl.store(
-        output_ptr + offset_t[:, None] * stride_o_t + offset_d[None, :], 
-        w, 
+        output_ptr + offset_t[:, None] * stride_o_t + offset_d[None, :],
+        w,
         mask = offset_t[:, None] < token_num
     )
 

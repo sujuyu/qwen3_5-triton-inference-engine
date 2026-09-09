@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
 """Dump Hugging Face reference tensors for the Qwen3.5-0.8B Triton engine.
 
-这个脚本**不属于推理引擎本体**，只在独立的 .venv-oracle 环境里跑一次，
-把参考实现的中间量存成 .pt，之后主环境不需要再装 transformers。
+这个脚本**不属于推理引擎本体**, 只在独立的 .venv-oracle 环境里跑一次,
+把参考实现的中间量存成 .pt, 之后主环境不需要再装 transformers.
 
-用法：
+用法:
     .venv-oracle/bin/python tools/dump_oracle.py
 
-产出（全部在 oracle/，已在 .gitignore 中排除）：
-    oracle/meta.pt          input_ids、prompt、config 关键值、生成的 token
-    oracle/hidden.pt        embedding 输出 + 24 层每层输出 + final norm，共 26 个 [1,T,1024]
-    oracle/layer00_gdn.pt   第 0 层（Gated DeltaNet）所有子模块的输入输出
-    oracle/layer03_attn.pt  第 3 层（full attention）所有子模块的输入输出
-    oracle/logits.pt        最后一个位置的 logits [248320]，以及 greedy token
+产出(全部在 oracle/, 已在 .gitignore 中排除):
+    oracle/meta.pt          input_ids, prompt, config 关键值, 生成的 token
+    oracle/hidden.pt        embedding 输出 + 24 层每层输出 + final norm, 共 26 个 [1,T,1024]
+    oracle/layer00_gdn.pt   第 0 层(Gated DeltaNet)所有子模块的输入输出
+    oracle/layer03_attn.pt  第 3 层(full attention)所有子模块的输入输出
+    oracle/logits.pt        最后一个位置的 logits [248320], 以及 greedy token
 
-所有张量按 CPU 保存。逐层对拍时用 torch.load 读回即可。
+所有张量按 CPU 保存. 逐层对拍时用 torch.load 读回即可.
 """
 
 from __future__ import annotations
@@ -30,15 +30,15 @@ ROOT = Path(__file__).resolve().parent.parent
 MODEL_DIR = ROOT / "Qwen3.5-0.8B"
 OUT_DIR = ROOT / "oracle"
 
-PROMPT = "你好，请简单介绍一下自己。"
+PROMPT = "你好, 请简单介绍一下自己."
 NUM_GENERATE = 32
 
-# 与 tokenize_text.py 保持一致的单轮 chat 模板（non-thinking）。
+# 与 tokenize_text.py 保持一致的单轮 chat 模板(non-thinking).
 RENDERED = f"<|im_start|>user\n{PROMPT}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
 
 
 def capture_module_io(module: torch.nn.Module, prefix: str, store: dict) -> list:
-    """给 module 及其所有子模块挂 forward hook，记录输入输出张量。"""
+    """给 module 及其所有子模块挂 forward hook, 记录输入输出张量."""
     handles = []
 
     def make_hook(name: str):
@@ -62,11 +62,11 @@ def capture_module_io(module: torch.nn.Module, prefix: str, store: dict) -> list
 
 
 def patch_free_functions(store: dict) -> None:
-    """conv、delta rule、RoPE 都是模块级自由函数，forward hook 抓不到。
+    """conv, delta rule, RoPE 都是模块级自由函数, forward hook 抓不到.
 
-    这里按调用顺序记录：conv 和 delta rule 每个 GDN 层各调一次（第 0 次 = layer 0），
-    apply_rotary_pos_emb 每个 full-attention 层各调一次（第 0 次 = layer 3）。
-    只保留第 0 次调用，正好对应我们要细看的那两层。
+    这里按调用顺序记录: conv 和 delta rule 每个 GDN 层各调一次(第 0 次 = layer 0),
+    apply_rotary_pos_emb 每个 full-attention 层各调一次(第 0 次 = layer 3).
+    只保留第 0 次调用, 正好对应我们要细看的那两层.
     """
     import transformers.models.qwen3_5.modeling_qwen3_5 as m
 
@@ -88,7 +88,7 @@ def patch_free_functions(store: dict) -> None:
         store["conv.out_bct"] = out.detach().float().cpu()
 
     def rec_delta(args, kwargs, out):
-        # 签名为 (query, key, value, g, beta, ...)，q/k 尚未做 l2norm 和 1/sqrt(D) scale
+        # 签名为 (query, key, value, g, beta, ...), q/k 尚未做 l2norm 和 1/sqrt(D) scale
         for i, key in enumerate(("query", "key", "value")):
             store[f"delta.{key}_pre_l2norm"] = args[i].detach().float().cpu()
         for key in ("g", "beta"):
@@ -120,7 +120,7 @@ def main() -> None:
     config = AutoConfig.from_pretrained(MODEL_DIR)
     tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)
 
-    # eager 实现：走本仓库对照过的那条数学路径，不落到 flash/sdpa 的融合分支。
+    # eager 实现: 走本仓库对照过的那条数学路径, 不落到 flash/sdpa 的融合分支.
     model = Qwen3_5ForConditionalGeneration.from_pretrained(
         MODEL_DIR,
         dtype=torch.bfloat16,
@@ -145,11 +145,11 @@ def main() -> None:
     handles = capture_module_io(layers[0], "layer00", gdn_store)
     handles += capture_module_io(layers[3], "layer03", attn_store)
 
-    # 自由函数的中间量：conv/delta 归到 layer00，rope 归到 layer03。
+    # 自由函数的中间量: conv/delta 归到 layer00, rope 归到 layer03.
     free_store: dict[str, torch.Tensor] = {}
     patch_free_functions(free_store)
 
-    # 最后一层的原始输出（final norm 之前），hidden_states 里拿不到。
+    # 最后一层的原始输出(final norm 之前), hidden_states 里拿不到.
     last_layer_out: dict[str, torch.Tensor] = {}
 
     def _last_layer_hook(_mod, _args, output):
@@ -174,13 +174,13 @@ def main() -> None:
         else:
             gdn_store[f"layer00.{key}"] = value
     assert any(k.endswith("conv.out_bct") for k in gdn_store), (
-        "conv 输出没抓到——transformers 可能改了 causal_conv1d_fn 的调用方式，"
+        "conv 输出没抓到 -- transformers 可能改了 causal_conv1d_fn 的调用方式,"
         "需要重新确认 patch 点"
     )
 
-    # hidden_states 的索引：hidden_{i+1} = 第 i 层的输出，i = 0..22。
-    # 但**最后一个是 final norm 之后**（RMS 会跳一个量级），不是第 23 层的原始输出，
-    # 所以第 23 层的原始输出要靠单独的 hook 拿，别对 hidden_states[-1] 再 norm 一次。
+    # hidden_states 的索引: hidden_{i+1} = 第 i 层的输出, i = 0..22.
+    # 但**最后一个是 final norm 之后**(RMS 会跳一个量级), 不是第 23 层的原始输出,
+    # 所以第 23 层的原始输出要靠单独的 hook 拿, 别对 hidden_states[-1] 再 norm 一次.
     hidden = {
         f"hidden_{i:02d}": h.detach().float().cpu()
         for i, h in enumerate(out.hidden_states)
@@ -194,7 +194,7 @@ def main() -> None:
     logits_last = out.logits[0, -1].detach().float().cpu()
     greedy_first = int(logits_last.argmax())
 
-    # 连续 greedy 生成，作为端到端验收基准。
+    # 连续 greedy 生成, 作为端到端验收基准.
     with torch.no_grad():
         generated = model.generate(
             input_ids=input_ids,

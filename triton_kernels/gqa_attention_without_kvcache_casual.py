@@ -10,8 +10,8 @@ import math
 '''
 针对qwen3.5 0.6b的GQA Attention实现 q_head=8 kv_head=2
 第一步暂时不支持kv cache, 直接做带casual的full-attention
-head维度上分为按照Q和KV的num_head切分两种方式 
-前者并行度大 需要L2 cache降低对global memory的读取压力 
+head维度上分为按照Q和KV的num_head切分两种方式
+前者并行度大 需要L2 cache降低对global memory的读取压力
 后者对于kv的读取量减少 同时启动的block数量也会降低
 '''
 
@@ -35,13 +35,13 @@ autotune_configs = [
 @triton.jit
 def _gqa_attention_without_kvcache_casual_triton(
     q_ptr, k_ptr, v_ptr, o_ptr,
-    stride_q_b, stride_q_h, stride_q_s, stride_q_d, 
-    stride_k_b, stride_k_h, stride_k_s, stride_k_d, 
-    stride_v_b, stride_v_h, stride_v_s, stride_v_d, 
-    stride_o_b, stride_o_h, stride_o_s, stride_o_d, 
+    stride_q_b, stride_q_h, stride_q_s, stride_q_d,
+    stride_k_b, stride_k_h, stride_k_s, stride_k_d,
+    stride_v_b, stride_v_h, stride_v_s, stride_v_d,
+    stride_o_b, stride_o_h, stride_o_s, stride_o_d,
     q_seq_len, kv_seq_len,
-    sm_scale: tl.constexpr, 
-    d_model: tl.constexpr, 
+    sm_scale: tl.constexpr,
+    d_model: tl.constexpr,
     group_size: tl.constexpr,
     BLOCK_Q_S: tl.constexpr,
     TILE_KV_S: tl.constexpr
@@ -55,7 +55,7 @@ def _gqa_attention_without_kvcache_casual_triton(
     q_base_ptr = q_ptr + batch_id * stride_q_b + head_id * group_size * stride_q_h
     o_base_ptr = o_ptr + batch_id * stride_o_b + head_id * group_size * stride_o_h
     # 对kv直接执行batch head维度消除
-    k_base_ptr = k_ptr + batch_id * stride_k_b + head_id * stride_k_h 
+    k_base_ptr = k_ptr + batch_id * stride_k_b + head_id * stride_k_h
     v_base_ptr = v_ptr + batch_id * stride_v_b + head_id * stride_v_h
 
     offset_d = tl.arange(0, d_model)
@@ -64,7 +64,7 @@ def _gqa_attention_without_kvcache_casual_triton(
 
     # [group_size, BLOCK_Q_S, d_model]
     q = tl.load(
-        q_base_ptr + offset_q_h[:, None, None] * stride_q_h + offset_q_s[None, :, None] * stride_q_s + offset_d[None, None, :] * stride_q_d, 
+        q_base_ptr + offset_q_h[:, None, None] * stride_q_h + offset_q_s[None, :, None] * stride_q_s + offset_d[None, None, :] * stride_q_d,
         mask=offset_q_s[None, :, None] < q_seq_len,
         other = 0.0
     )
@@ -79,9 +79,9 @@ def _gqa_attention_without_kvcache_casual_triton(
     )
 
     v_block_ptr = tl.make_block_ptr(
-        base = v_base_ptr, 
-        shape = (kv_seq_len, d_model), 
-        strides = (stride_v_s, stride_v_d), 
+        base = v_base_ptr,
+        shape = (kv_seq_len, d_model),
+        strides = (stride_v_s, stride_v_d),
         offsets = (0, 0),
         block_shape = (TILE_KV_S, d_model),
         order = (1, 0)
@@ -110,7 +110,7 @@ def _gqa_attention_without_kvcache_casual_triton(
             <= offset_q_s[None, :, None]
         )
 
-        # tl.where 不会原地修改，必须赋值
+        # tl.where 不会原地修改, 必须赋值
         qk = tl.where(causal_mask, qk, float("-inf"))
 
         m_i_new = tl.maximum(m_i, tl.max(qk, axis = -1))
@@ -129,8 +129,8 @@ def _gqa_attention_without_kvcache_casual_triton(
 
     acc = acc / l_i[:, :, None]
     tl.store(
-        o_base_ptr + offset_q_h[:, None, None] * stride_o_h + offset_q_s[None, :, None] * stride_o_s + offset_d[None, None, :] * stride_o_d, 
-        acc.to(tl.bfloat16), 
+        o_base_ptr + offset_q_h[:, None, None] * stride_o_h + offset_q_s[None, :, None] * stride_o_s + offset_d[None, None, :] * stride_o_d,
+        acc.to(tl.bfloat16),
         mask=offset_q_s[None, :, None] < q_seq_len,
     )
 
@@ -181,7 +181,7 @@ def gqa_attention_without_kvcache_casual(
         group_size=num_q_head // kv_num_head
     )
 
-    return o 
+    return o
 
 
 @torch.library.register_fake("wy_lib::gqa_attention_without_kvcache_casual")

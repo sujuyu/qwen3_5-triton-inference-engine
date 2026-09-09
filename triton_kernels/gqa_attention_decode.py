@@ -1,79 +1,79 @@
-"""带 KV cache 的 GQA decode（单 token query 对全部历史 K/V）。
+"""带 KV cache 的 GQA decode(单 token query 对全部历史 K/V).
 
-这是 3.3 `gqa_attention_without_kvcache_casual` 的 decode 版，也是切换到增量
-decode 所缺的最后一块（GDN 的两个 cache kernel 已就位，见 3.8b / 3.10b）。
+这是 3.3 `gqa_attention_without_kvcache_casual` 的 decode 版, 也是切换到增量
+decode 所缺的最后一块(GDN 的两个 cache kernel 已就位, 见 3.8b / 3.10b).
 
 与 prefill 版的三个关键差别
 --------------------------
-1. **不需要 causal mask**。cache 里的每一个位置都在新 token 之前（或就是它自己），
-   全部都该被 attend。prefill 那种下三角 mask 在这里是多余的。
-2. **query 只有一行**，`[H_q, D]`。所以没有 Q 方向的分块，只在 T 方向做 online softmax。
-3. **K/V 来自 cache 而不是参数**，且新 token 的 K/V 要先追加进 cache。
+1. **不需要 causal mask**. cache 里的每一个位置都在新 token 之前(或就是它自己),
+   全部都该被 attend. prefill 那种下三角 mask 在这里是多余的.
+2. **query 只有一行**, `[H_q, D]`. 所以没有 Q 方向的分块, 只在 T 方向做 online softmax.
+3. **K/V 来自 cache 而不是参数**, 且新 token 的 K/V 要先追加进 cache.
 
-cache 布局：`[H_kv, T_max, D]`，整块预分配
+cache 布局: `[H_kv, T_max, D]`, 整块预分配
 -----------------------------------------
-不做 paging。paging 解决的四个问题（多序列碎片、continuous batching、前缀共享、
-beam search 分叉）当前一个都不存在——batch 恒为 1、greedy、单序列。将来要加也很便宜：
-kernel 里 T 方向本来就是分块遍历，插 paging 只是在循环里多一次块表查询。
+不做 paging. paging 解决的四个问题(多序列碎片, continuous batching, 前缀共享,
+beam search 分叉)当前一个都不存在 -- batch 恒为 1, greedy, 单序列. 将来要加也很便宜:
+kernel 里 T 方向本来就是分块遍历, 插 paging 只是在循环里多一次块表查询.
 
-选 `[H_kv, T_max, D]` 而不是 `[H_kv, D, T_max]` 或 `[T_max, H_kv, D]`：
+选 `[H_kv, T_max, D]` 而不是 `[H_kv, D, T_max]` 或 `[T_max, H_kv, D]`:
 
-    读：一次取 k_cache[h, t0:t0+BLOCK_T, :]，D 维连续，每行 512B 全部用满
-    写：新 token 每个 head 写 256 个连续值，一次连续写
+    读: 一次取 k_cache[h, t0:t0+BLOCK_T, :], D 维连续, 每行 512B 全部用满
+    写: 新 token 每个 head 写 256 个连续值, 一次连续写
 
-另外两种布局的写入都是跨步的。KV cache 在 8K 上下文是 96 MiB，**远超 A100 的 40MB
-L2**，所以这里的合并访问是实打实的 DRAM 带宽，不像 conv state 那样能靠 cache 兜底
-（见 3.8b 的实测：装得下 cache 时布局无差别，超出后差 2.82 倍）。
+另外两种布局的写入都是跨步的. KV cache 在 8K 上下文是 96 MiB, **远超 A100 的 40MB
+L2**, 所以这里的合并访问是实打实的 DRAM 带宽, 不像 conv state 那样能靠 cache 兜底
+(见 3.8b 的实测: 装得下 cache 时布局无差别, 超出后差 2.82 倍).
 
-显存：6 层 × 2 KV head × 256 dim × 2 字节 × 2(K+V) = 12 KiB/token。
-8K 上下文 96 MiB，32K 384 MiB，batch=1 下都可以接受。
+显存: 6 层 × 2 KV head × 256 dim × 2 字节 × 2(K+V) = 12 KiB/token.
+8K 上下文 96 MiB, 32K 384 MiB, batch=1 下都可以接受.
 
-**cache 里存的必须是 RoPE 之后的 K。** 参考实现 `Qwen3_5Attention.forward` 的顺序是
-先 `apply_rotary_pos_emb` 再 `past_key_values.update`。存 RoPE 前的值、每步重新旋转
-是错的——历史 token 的 position 不会变。
+**cache 里存的必须是 RoPE 之后的 K. ** 参考实现 `Qwen3_5Attention.forward` 的顺序是
+先 `apply_rotary_pos_emb` 再 `past_key_values.update`. 存 RoPE 前的值, 每步重新旋转
+是错的 -- 历史 token 的 position 不会变.
 
 接口
 ----
-    q:       [H_q, D]        BF16   新 token 的 query，已过 q_norm 和 RoPE
-    k_new:   [H_kv, D]       BF16   新 token 的 key，已过 k_norm 和 RoPE
+    q:       [H_q, D]        BF16   新 token 的 query, 已过 q_norm 和 RoPE
+    k_new:   [H_kv, D]       BF16   新 token 的 key, 已过 k_norm 和 RoPE
     v_new:   [H_kv, D]       BF16
     k_cache: [H_kv,T_max,D]  BF16   原地追加
     v_cache: [H_kv,T_max,D]  BF16   原地追加
     past_len: int                   追加位置 = 追加前的历史长度
     out:     [H_q, D]        BF16
 
-运算（GROUP = H_q // H_kv = 4）
+运算(GROUP = H_q // H_kv = 4)
 ------------------------------
-    追加：k_cache[h_kv, past_len, :] = k_new[h_kv, :]，v 同理
+    追加: k_cache[h_kv, past_len, :] = k_new[h_kv, :], v 同理
     S = past_len + 1
-    对每个 query head h_q，取 h_kv = h_q // GROUP：
+    对每个 query head h_q, 取 h_kv = h_q // GROUP:
         score[t] = dot(q[h_q,:], k_cache[h_kv,t,:]) * D^-0.5      t = 0..S-1
         p        = softmax_fp32(score)
         out[h_q] = sum_t p[t] * v_cache[h_kv,t,:]
 
 追加放在 python wrapper 里而不是 kernel 里
 ------------------------------------------
-如果在 kernel 里追加，同一个 h_kv 会被 GROUP 个 program 同时写同一个位置（写的值相同，
-数据上无害），但紧接着又要读回这个位置——跨 program 的写后读没有可见性保证，需要
-fence。放在 wrapper 里用一次 slice 赋值最简单也最容易验证。
+如果在 kernel 里追加, 同一个 h_kv 会被 GROUP 个 program 同时写同一个位置(写的值相同,
+数据上无害), 但紧接着又要读回这个位置 -- 跨 program 的写后读没有可见性保证, 需要
+fence. 放在 wrapper 里用一次 slice 赋值最简单也最容易验证.
 
-代价是每层多两次 PyTorch copy 的 launch。想融进 kernel 的话正确做法是：循环只读
-`[0, past_len)`，新 token 的 k/v 直接从寄存器参与 online softmax 的最后一步，
-完全不经过 cache 读回。这是后续的融合点，不是第一版该做的事。
+代价是每层多两次 PyTorch copy 的 launch. 想融进 kernel 的话正确做法是: 循环只读
+`[0, past_len)`, 新 token 的 k/v 直接从寄存器参与 online softmax 的最后一步,
+完全不经过 cache 读回. 这是后续的融合点, 不是第一版该做的事.
 
-按 KV head 分块，grid = `(H_kv,)` = 2
+按 KV head 分块, grid = `(H_kv,)` = 2
 -------------------------------------
-与 prefill 版同一个选择：一个 program 负责一个 KV head 及其 GROUP 个 Q head，
-KV 只读一遍。按 Q head 分块的话 grid=(8,)，每个 KV head 会被读 4 遍。
+与 prefill 版同一个选择: 一个 program 负责一个 KV head 及其 GROUP 个 Q head,
+KV 只读一遍. 按 Q head 分块的话 grid=(8,), 每个 KV head 会被读 4 遍.
 
-**grid 必须是 `num_kv_heads` 而不是 `num_q_heads`。** kernel 里
-`offset_h = pid * GROUP + tl.arange(0, GROUP)`，用 8 起 grid 的话 pid=2..7 会
-越界读 cache、并越界写 `out`（写到第 31 行，而 out 只有 8 行），踩坏分配器里
-相邻的张量——表现为"数据相关的错值"，最后变成 illegal memory access。
+**grid 必须是 `num_kv_heads` 而不是 `num_q_heads`. ** kernel 里
+`offset_h = pid * GROUP + tl.arange(0, GROUP)`, 用 8 起 grid 的话 pid=2..7 会
+越界读 cache, 并越界写 `out`(写到第 31 行, 而 out 只有 8 行), 踩坏分配器里
+相邻的张量 -- 表现为"数据相关的错值", 最后变成 illegal memory access.
 
-下一步必须做 split-K（不是可选优化）
+下一步必须做 split-K(不是可选优化)
 -------------------------------------
-代价是 CTA 只有 2 个。实测（A100，流式读 96 MiB）：
+代价是 CTA 只有 2 个. 实测(A100, 流式读 96 MiB):
 
     CTA 数     2 warp     4 warp     8 warp    16 warp
         2       4GB/s      8GB/s     21GB/s     46GB/s
@@ -81,33 +81,33 @@ KV 只读一遍。按 Q head 分块的话 grid=(8,)，每个 KV head 会被读 4
       108     206GB/s    393GB/s    877GB/s   1186GB/s
       432     675GB/s    998GB/s   1171GB/s   1195GB/s   ← 饱和约 1170 GB/s
 
-**2 个 CTA 即使开 16 warp 也只有饱和带宽的 4%**——天花板由"只占 2 个 SM"决定，
-加 warp 补不回来。带宽大致正比于在飞的 warp 总数（约 1.4 GB/s per warp），
-要打满需要 ~100 个 CTA（8 warp）或 ~50 个（16 warp）。
+**2 个 CTA 即使开 16 warp 也只有饱和带宽的 4%** -- 天花板由"只占 2 个 SM"决定,
+加 warp 补不回来. 带宽大致正比于在飞的 warp 总数(约 1.4 GB/s per warp),
+要打满需要 ~100 个 CTA(8 warp)或 ~50 个(16 warp).
 
-split-K：把 T 切成 num_splits 段，grid 变成 `(H_kv, num_splits)`，每段算局部
-(m_i, l_i, acc)，再用第二个 kernel 归约：
+split-K: 把 T 切成 num_splits 段, grid 变成 `(H_kv, num_splits)`, 每段算局部
+(m_i, l_i, acc), 再用第二个 kernel 归约:
 
     m   = max_i m_i
     l   = sum_i l_i * exp(m_i - m)
     acc = sum_i acc_i * exp(m_i - m)
     out = acc / l
 
-num_splits 取 50~200（即 100~400 个 CTA）就能进饱和区。按 6 层合计估算：
+num_splits 取 50~200(即 100~400 个 CTA)就能进饱和区. 按 6 层合计估算:
 
-    T       不切 T（2 CTA/8 warp）    split-K      倍数
+    T       不切 T(2 CTA/8 warp)    split-K      倍数
     512            300 us              39 us       7.7x
     2048           1.2 ms              42 us        29x
     8192           4.8 ms              92 us        52x
 
-对照：每个 decode step 必须读一遍全部 1.4 GiB 权重 ≈ 1.23 ms。不切 T 的话
-T=2048 时 attention 就和整个模型的权重读取一样贵了。
+对照: 每个 decode step 必须读一遍全部 1.4 GiB 权重 ≈ 1.23 ms. 不切 T 的话
+T=2048 时 attention 就和整个模型的权重读取一样贵了.
 
-本文件这个不切 T 的版本是 split-K 的对拍基准——跨 split 的 m/l 重缩放是 bug
-高发区，错了往往只偏一点点，没有基准很难发现。
+本文件这个不切 T 的版本是 split-K 的对拍基准 -- 跨 split 的 m/l 重缩放是 bug
+高发区, 错了往往只偏一点点, 没有基准很难发现.
 
-另：autotune 的 num_warps 目前只到 8。decode 是纯 memory-bound 且 CTA 数很少，
-warp 数影响很大（上表 2 CTA 那行 4 warp 8GB/s vs 16 warp 46GB/s），建议加到 16。
+另: autotune 的 num_warps 目前只到 8. decode 是纯 memory-bound 且 CTA 数很少,
+warp 数影响很大(上表 2 CTA 那行 4 warp 8GB/s vs 16 warp 46GB/s), 建议加到 16.
 """
 
 import torch
@@ -126,7 +126,7 @@ autotune_configs = [
 
 
 def _seq_bucket(seq_len: int) -> int:
-    """seq_len 每步都在涨，直接进 autotune key 会导致每步重新调优。分桶。"""
+    """seq_len 每步都在涨, 直接进 autotune key 会导致每步重新调优. 分桶."""
     if seq_len <= 64:
         return 64
     if seq_len <= 256:
@@ -147,32 +147,32 @@ def _gqa_attention_decode_triton(
     q_ptr,  # [H_q, D] BF16
     stride_q_h: tl.constexpr,
     stride_q_d: tl.constexpr,
-    k_cache_ptr,  # [H_kv, T_max, D] BF16，只读（追加已在 wrapper 里做完）
+    k_cache_ptr,  # [H_kv, T_max, D] BF16, 只读(追加已在 wrapper 里做完)
     stride_kc_h: tl.constexpr,
     stride_kc_t: tl.constexpr,
     stride_kc_d: tl.constexpr,
-    v_cache_ptr,  # [H_kv, T_max, D] BF16，只读
+    v_cache_ptr,  # [H_kv, T_max, D] BF16, 只读
     stride_vc_h: tl.constexpr,
     stride_vc_t: tl.constexpr,
     stride_vc_d: tl.constexpr,
     out_ptr,  # [H_q, D] BF16
     stride_o_h: tl.constexpr,
     stride_o_d: tl.constexpr,
-    pos_ptr,  # [1] INT64，当前已缓存的 token 数（= past_len），**放在显存里**
-    scale,  # = D ** -0.5，FP32
+    pos_ptr,  # [1] INT64, 当前已缓存的 token 数(= past_len), **放在显存里**
+    scale,  # = D ** -0.5, FP32
     H_Q: tl.constexpr,
     D: tl.constexpr,
     GROUP: tl.constexpr,  # H_q // H_kv
     S_BUCKET: tl.constexpr,
     BLOCK_T: tl.constexpr,
 ):
-    # seq_len 从显存读而不是当标量参数传，是为了让这个 kernel 能被 CUDA Graph 捕获。
-    # CUDA Graph 在 capture 时会把标量 kernel 参数**烧进** launch 配置，replay 时用的
-    # 永远是 capture 那一刻的值；而 decode 每步 seq_len 都在变，图就废了。实测：
-    #     标量参数：capture 时 n=100，replay 传 300/777 得到的仍是 100
-    #     显存 + tl.load：replay 得到 300/777，正确
-    # 指针地址在整个生命周期不变，所以图始终有效；改的只是那 8 个字节的内容。
-    # 代价是每次多一个 4/8 字节的 global load，L2 常驻可以忽略。
+    # seq_len 从显存读而不是当标量参数传, 是为了让这个 kernel 能被 CUDA Graph 捕获.
+    # CUDA Graph 在 capture 时会把标量 kernel 参数**烧进** launch 配置, replay 时用的
+    # 永远是 capture 那一刻的值; 而 decode 每步 seq_len 都在变, 图就废了. 实测:
+    #     标量参数: capture 时 n=100, replay 传 300/777 得到的仍是 100
+    #     显存 + tl.load: replay 得到 300/777, 正确
+    # 指针地址在整个生命周期不变, 所以图始终有效; 改的只是那 8 个字节的内容.
+    # 代价是每次多一个 4/8 字节的 global load, L2 常驻可以忽略.
     seq_len = tl.load(pos_ptr).to(tl.int32) + 1
 
     # 按照kv的head切分block 减少对kv的读取
@@ -194,7 +194,7 @@ def _gqa_attention_decode_triton(
     for t0 in tl.range(0, seq_len, BLOCK_T):
         offset_t = t0 + tl.arange(0, BLOCK_T)
         k = tl.load(
-            k_cache_ptr + offset_t[None, :] * stride_kc_t + offset_d[:, None] * stride_kc_d, 
+            k_cache_ptr + offset_t[None, :] * stride_kc_t + offset_d[:, None] * stride_kc_d,
             mask = offset_t[None, :] < seq_len,
             other = 0.0
         ) # [D, BLOCK_T] 载入过程中完成转置
@@ -211,16 +211,16 @@ def _gqa_attention_decode_triton(
             other = 0.0
         )
 
-        # p 是 FP32、v 是 BF16，tl.dot 要求两个操作数同 dtype，这里显式降到 BF16
+        # p 是 FP32, v 是 BF16, tl.dot 要求两个操作数同 dtype, 这里显式降到 BF16
         acc = acc * alpha[:, None] + tl.dot(p.to(tl.bfloat16), v) # [GROUP, D]
         l_i = l_i * alpha + tl.sum(p, axis=1)
 
-        m_i = m_i_new 
+        m_i = m_i_new
 
     out = acc / l_i[:, None]
 
     # 写回
-    # element_ty 只有指针类型才有，要取 out_ptr 的而不是 out 这个值的
+    # element_ty 只有指针类型才有, 要取 out_ptr 的而不是 out 这个值的
     tl.store(out_ptr + offset_h[:, None] * stride_o_h + offset_d[None, :] * stride_o_d, out.to(out_ptr.dtype.element_ty))
 
 
@@ -254,21 +254,21 @@ def gqa_attention_decode(
     assert pos.dtype == torch.int64 and pos.numel() == 1
     assert triton.next_power_of_2(head_dim) == head_dim
 
-    # 追加放在这里而不是 kernel 里：kernel 里同一个 KV head 会被 GROUP 个 program
-    # 同时写、随即又读回，跨 program 的写后读没有可见性保证。详见模块 docstring。
+    # 追加放在这里而不是 kernel 里: kernel 里同一个 KV head 会被 GROUP 个 program
+    # 同时写, 随即又读回, 跨 program 的写后读没有可见性保证. 详见模块 docstring.
     #
-    # 用 index_copy_ 而不是 `k_cache[:, past_len, :] = k_new`：后者的下标是 python int，
-    # CUDA Graph capture 时会把偏移烧进 copy kernel，replay 永远写同一行。
-    # index_copy_ 的下标来自显存，kernel 执行时才读，所以可以被捕获且 replay 正确
-    # （已实测）。
+    # 用 index_copy_ 而不是 `k_cache[:, past_len, :] = k_new`: 后者的下标是 python int,
+    # CUDA Graph capture 时会把偏移烧进 copy kernel, replay 永远写同一行.
+    # index_copy_ 的下标来自显存, kernel 执行时才读, 所以可以被捕获且 replay 正确
+    # (已实测).
     k_cache.index_copy_(1, pos, k_new.unsqueeze(1))
     v_cache.index_copy_(1, pos, v_new.unsqueeze(1))
 
     out = torch.empty_like(q)
 
-    # 按 KV head 分块：一个 program 负责一个 KV head 及其 GROUP 个 Q head。
-    # 这里必须是 num_kv_heads——kernel 里 offset_h = pid * GROUP + arange(GROUP)，
-    # 用 num_q_heads 起 grid 会让 pid>=num_kv_heads 的 program 越界读 cache、越界写 out。
+    # 按 KV head 分块: 一个 program 负责一个 KV head 及其 GROUP 个 Q head.
+    # 这里必须是 num_kv_heads -- kernel 里 offset_h = pid * GROUP + arange(GROUP),
+    # 用 num_q_heads 起 grid 会让 pid>=num_kv_heads 的 program 越界读 cache, 越界写 out.
     torch.library.wrap_triton(_gqa_attention_decode_triton)[(num_kv_heads,)](
         q_ptr=q,
         stride_q_h=q.stride(0),
@@ -289,10 +289,10 @@ def gqa_attention_decode(
         H_Q=num_q_heads,
         D=head_dim,
         GROUP=num_q_heads // num_kv_heads,
-        # seq_bucket 只影响 autotune 选哪个 config，不参与任何计算。它必须是
-        # host 侧的 python int（autotune 的 key 只能是标量）。在 CUDA Graph 下
-        # config 冻结在 capture 那一刻——这是可接受的，因为选错 config 只是慢一点，
-        # 不会算错。correctness 全部由显存里的 pos 决定。
+        # seq_bucket 只影响 autotune 选哪个 config, 不参与任何计算. 它必须是
+        # host 侧的 python int(autotune 的 key 只能是标量). 在 CUDA Graph 下
+        # config 冻结在 capture 那一刻 -- 这是可接受的, 因为选错 config 只是慢一点,
+        # 不会算错. correctness 全部由显存里的 pos 决定.
         S_BUCKET=_seq_bucket(seq_bucket),
     )
     return out
@@ -319,88 +319,88 @@ def call_gqa_attention_decode_triton(
     v_cache: torch.Tensor,
     past_len,
 ) -> torch.Tensor:
-    """past_len 可以是 int（测试/非 graph 路径）或 [1] INT64 显存张量（graph 路径）。"""
+    """past_len 可以是 int(测试/非 graph 路径)或 [1] INT64 显存张量(graph 路径)."""
     pos = _as_position(past_len, q.device)
-    # seq_bucket 只用于 autotune 选 config。传 int 时直接用；传张量时无法在不同步的
-    # 前提下读出它，退而用 cache 容量作为上界——config 选得保守一点，但不影响正确性。
+    # seq_bucket 只用于 autotune 选 config. 传 int 时直接用; 传张量时无法在不同步的
+    # 前提下读出它, 退而用 cache 容量作为上界 -- config 选得保守一点, 但不影响正确性.
     hint = past_len + 1 if isinstance(past_len, int) else k_cache.shape[1]
     return gqa_attention_decode(q, k_new, v_new, k_cache, v_cache, pos, hint)
 
 
 # ===========================================================================
-# 关于 CUDA Graph：这套 decode kernel 为什么长成现在这样
+# 关于 CUDA Graph: 这套 decode kernel 为什么长成现在这样
 # ===========================================================================
 #
-# CUDA Graph 干的事很简单：把一串 kernel launch 连同它们的参数录下来，之后一次
-# replay 就把整串重放一遍。省掉的是 CPU 侧逐次 launch 的开销——而我们实测那部分
-# 占了 eager 下 forward 时间的 92%，所以对 decode 这种"每步都是
-# 一堆小 kernel"的场景，它几乎是唯一的解法。
+# CUDA Graph 干的事很简单: 把一串 kernel launch 连同它们的参数录下来, 之后一次
+# replay 就把整串重放一遍. 省掉的是 CPU 侧逐次 launch 的开销 -- 而我们实测那部分
+# 占了 eager 下 forward 时间的 92%, 所以对 decode 这种"每步都是
+# 一堆小 kernel"的场景, 它几乎是唯一的解法.
 #
-# 但"把参数一起录下来"这句话有代价，而且代价正好落在 decode 最需要变的东西上。
+# 但"把参数一起录下来"这句话有代价, 而且代价正好落在 decode 最需要变的东西上.
 #
-# 一、标量参数会被冻结
+# 一, 标量参数会被冻结
 # --------------------
-# capture 时传进去的标量直接烧进 launch 配置，replay 只是重放，不会重新求值。
-# decode 每步 seq_len 都在涨，于是：
+# capture 时传进去的标量直接烧进 launch 配置, replay 只是重放, 不会重新求值.
+# decode 每步 seq_len 都在涨, 于是:
 #
-#     seq_len 作为标量参数：      capture 时 n=100，replay 传 300/777 得到的仍是 100
-#     seq_len 放显存 + tl.load：  replay 得到 300/777，正确
+#     seq_len 作为标量参数:      capture 时 n=100, replay 传 300/777 得到的仍是 100
+#     seq_len 放显存 + tl.load:  replay 得到 300/777, 正确
 #
-# 切片下标也一样，它最终变成 copy kernel 里的一个常量偏移：
+# 切片下标也一样, 它最终变成 copy kernel 里的一个常量偏移:
 #
-#     cache[:, past_len, :] = v   （past_len 是 python int）  replay 三次都写第 0 行
-#     cache.index_copy_(1, pos, v)（pos 是显存张量）          replay 三次写第 0/1/2 行
+#     cache[:, past_len, :] = v   (past_len 是 python int)  replay 三次都写第 0 行
+#     cache.index_copy_(1, pos, v)(pos 是显存张量)          replay 三次写第 0/1/2 行
 #
-# 解法是把所有"每步会变的量"收进一个显存张量。本文件里就是 `pos`：seq_len、
-# split 的 chunk、combine 的 num_active 全部由它在 kernel 内算出来，host 一个都不传。
-# 顺带一个好处是 split 和 combine 必然同源，不会对"哪些 split 有效"产生分歧。
+# 解法是把所有"每步会变的量"收进一个显存张量. 本文件里就是 `pos`: seq_len,
+# split 的 chunk, combine 的 num_active 全部由它在 kernel 内算出来, host 一个都不传.
+# 顺带一个好处是 split 和 combine 必然同源, 不会对"哪些 split 有效"产生分歧.
 #
-# 更进一步，把 `pos.add_(1)` 也录进图里，位置就会随 replay 自动前进，host 侧每步
-# 只剩"写输入槽 + replay"。代价是图变成有状态的——capture 本身（warmup + 正式
-# 捕获）会把 pos 推进好几格、也会污染 cache，捕获完必须显式复位。
+# 更进一步, 把 `pos.add_(1)` 也录进图里, 位置就会随 replay 自动前进, host 侧每步
+# 只剩"写输入槽 + replay". 代价是图变成有状态的 -- capture 本身(warmup + 正式
+# 捕获)会把 pos 推进好几格, 也会污染 cache, 捕获完必须显式复位.
 #
-# 二、grid 会被冻结
+# 二, grid 会被冻结
 # -----------------
-# 这条绕不过去：grid 是 launch 配置的一部分，capture 之后就固定了。所以任何
-# "grid 随输入变化"的设计都与 CUDA Graph 不兼容。
+# 这条绕不过去: grid 是 launch 配置的一部分, capture 之后就固定了. 所以任何
+# "grid 随输入变化"的设计都与 CUDA Graph 不兼容.
 #
-# 本文件恰好躲开了这个坑，而且不完全是运气：
+# 本文件恰好躲开了这个坑, 而且不完全是运气:
 #
 #     不切 T   grid=(H_kv,)               写死
-#     split    grid=(H_kv, MAX_SPLITS)    写死——MAX_SPLITS 是常数而不是随 seq_len 变
-#     combine  grid=(H_q, D//BLOCK_D)     依赖 config，但它的 autotune key 不含
-#                                          S_BUCKET，对固定模型形状是常量
+#     split    grid=(H_kv, MAX_SPLITS)    写死 -- MAX_SPLITS 是常数而不是随 seq_len 变
+#     combine  grid=(H_q, D//BLOCK_D)     依赖 config, 但它的 autotune key 不含
+#                                          S_BUCKET, 对固定模型形状是常量
 #
-# 当初把 num_splits 定成常数 MAX_SPLITS 的理由是"更多 split 没有收益"（CTA 数过
-# ~432 带宽就饱和），现在看它顺带满足了这条硬约束。而 T 方向的遍历放在 kernel
-# 内部循环里、不进 grid，也是同样的效果——随 seq_bucket 变的只有 BLOCK_T，
-# 它是循环分块，不影响 grid。
+# 当初把 num_splits 定成常数 MAX_SPLITS 的理由是"更多 split 没有收益"(CTA 数过
+# ~432 带宽就饱和), 现在看它顺带满足了这条硬约束. 而 T 方向的遍历放在 kernel
+# 内部循环里, 不进 grid, 也是同样的效果 -- 随 seq_bucket 变的只有 BLOCK_T,
+# 它是循环分块, 不影响 grid.
 #
-# 实测跨桶 replay（捕获时 pos=50，一路跑到 600，跨过 64 和 256 两条边界）结果正确，
-# 因为 replay 根本不会重走 Python 的 autotuner。
+# 实测跨桶 replay(捕获时 pos=50, 一路跑到 600, 跨过 64 和 256 两条边界)结果正确,
+# 因为 replay 根本不会重走 Python 的 autotuner.
 #
-# 三、config 也被冻结，于是有了"每桶一张图"
+# 三, config 也被冻结, 于是有了"每桶一张图"
 # ------------------------------------------
-# autotune 的 key 只能是 host 侧标量，所以三个 op 都额外收一个 seq_bucket: int。
-# 它不参与任何计算，只决定选哪个 config；correctness 完全由显存里的 pos 决定。
+# autotune 的 key 只能是 host 侧标量, 所以三个 op 都额外收一个 seq_bucket: int.
+# 它不参与任何计算, 只决定选哪个 config; correctness 完全由显存里的 pos 决定.
 #
-# 但 config 里的 BLOCK_T 会随 seq_bucket 变，而 capture 之后它就固定了：
+# 但 config 里的 BLOCK_T 会随 seq_bucket 变, 而 capture 之后它就固定了:
 #
 #     seq_len=  64  BLOCK_T=16 warps=4 stages=2   12.53us
 #     seq_len= 256  BLOCK_T=16 warps=4 stages=2   13.37us
 #     seq_len=1024  BLOCK_T=16 warps=4 stages=1   13.43us
 #     seq_len=4095  BLOCK_T=32 warps=4 stages=2   14.51us
 #
-# 拿短序列调出来的 config 去跑长序列，只是慢一点、不会算错。当前跨度不大（12.5 ->
-# 14.5us，而且大部分是序列变长本身带来的），所以单张图够用。但要做得更好，
-# 正确的方向是**每个 bucket 捕获一张图**，按 host 已知的 seq_len 选：
+# 拿短序列调出来的 config 去跑长序列, 只是慢一点, 不会算错. 当前跨度不大(12.5 ->
+# 14.5us, 而且大部分是序列变长本身带来的), 所以单张图够用. 但要做得更好,
+# 正确的方向是**每个 bucket 捕获一张图**, 按 host 已知的 seq_len 选:
 #
 #     graphs = {}
 #     pool = None
 #     for b in (64, 256, 1024, 4096):
 #         pos.fill_(b - 1); warmup()
 #         g = torch.cuda.CUDAGraph()
-#         # 关键：第二张图开始复用第一张的内存池
+#         # 关键: 第二张图开始复用第一张的内存池
 #         with torch.cuda.graph(g, pool=pool) if pool else torch.cuda.graph(g):
 #             one_decode_step()
 #         pool = pool or g.pool()
@@ -408,92 +408,92 @@ def call_gqa_attention_decode_triton(
 #
 #     graphs[_seq_bucket(seq_len)].replay()
 #
-# 四、图的私有内存池：装什么、为什么必须共享
+# 四, 图的私有内存池: 装什么, 为什么必须共享
 # ------------------------------------------
-# 先分清两类张量：
+# 先分清两类张量:
 #
-#     capture **之前**分配的（权重、KV cache、pos、输入输出槽）
-#         走普通 caching allocator，不进图的池。图只把它们的**地址常量**录进
-#         kernel 参数，所以天然被所有图共享，与 pool= 无关。实测三次 capture 中
-#         W / inp / dst 的 data_ptr 始终不变。
+#     capture **之前**分配的(权重, KV cache, pos, 输入输出槽)
+#         走普通 caching allocator, 不进图的池. 图只把它们的**地址常量**录进
+#         kernel 参数, 所以天然被所有图共享, 与 pool= 无关. 实测三次 capture 中
+#         W / inp / dst 的 data_ptr 始终不变.
 #
-#     capture **期间**分配的（op 里的 `out = torch.empty_like(q)` 等中间量）
-#         走图的**私有池**，默认每张图一个。
+#     capture **期间**分配的(op 里的 `out = torch.empty_like(q)` 等中间量)
+#         走图的**私有池**, 默认每张图一个.
 #
-# 关键在于：图里烧的是绝对地址，而图之后还要被 replay 任意多次，每次都往那些地址
-# 写。所以那批地址在图的整个生命周期内必须归它所有，不能还给 allocator——
-# **capture 结束并不释放，池的生命周期绑定在图对象上**。实测：
+# 关键在于: 图里烧的是绝对地址, 而图之后还要被 replay 任意多次, 每次都往那些地址
+# 写. 所以那批地址在图的整个生命周期内必须归它所有, 不能还给 allocator --
+# **capture 结束并不释放, 池的生命周期绑定在图对象上**. 实测:
 #
 #     基线                        32.0 MiB
-#     capture 图1（私有池）        66.0 MiB   +34
-#     capture 图2（另一个私有池）   98.0 MiB   +34   ← 累加，不复用
+#     capture 图1(私有池)        66.0 MiB   +34
+#     capture 图2(另一个私有池)   98.0 MiB   +34   ← 累加, 不复用
 #     删掉图1                     66.0 MiB   -34   ← 图一死才还回来
 #     删掉图2                     32.0 MiB   -34
 #
-#     图3 存活时再普通分配 48 MiB，reserved 又涨 48 MiB   ← 池不与普通分配互通
+#     图3 存活时再普通分配 48 MiB, reserved 又涨 48 MiB   ← 池不与普通分配互通
 #
-# 所以「N 张图不共享池 = N 套中间量同时驻留」，**不是因为它们会并发执行**，
-# 而是因为每张图永久持有自己 capture 时拿到的那批地址。哪怕永远串行 replay，
-# 只要两张图都活着，两套地址就都得保留。实测（每次 capture 内 3 个 16 MiB 中间量）：
+# 所以"N 张图不共享池 = N 套中间量同时驻留", **不是因为它们会并发执行**,
+# 而是因为每张图永久持有自己 capture 时拿到的那批地址. 哪怕永远串行 replay,
+# 只要两张图都活着, 两套地址就都得保留. 实测(每次 capture 内 3 个 16 MiB 中间量):
 #
 #     图数      各自私有池     共享池
 #     1 张       34.0 MiB     34.0 MiB
 #     2 张       66.0 MiB     34.0 MiB
 #     4 张      130.0 MiB     34.0 MiB
-#     8 张      258.0 MiB     34.0 MiB      ← 私有 O(N)，共享 O(1)
+#     8 张      258.0 MiB     34.0 MiB      ← 私有 O(N), 共享 O(1)
 #
-# 共享池省的也不是「运行时错开使用」，而是**capture 时就没有多分配**：第二次
-# capture 在同一个池的 free list 里找到上次回收的同样大小的块，原地发回去，
-# 两张图录进去的就是同一组指针。实测图1 和图2 共享池时中间量地址完全相同，
-# 各开新池则不同。
+# 共享池省的也不是"运行时错开使用", 而是**capture 时就没有多分配**: 第二次
+# capture 在同一个池的 free list 里找到上次回收的同样大小的块, 原地发回去,
+# 两张图录进去的就是同一组指针. 实测图1 和图2 共享池时中间量地址完全相同,
+# 各开新池则不同.
 #
-#     注意它并不「识别同一个变量」。地址重合的条件是**同时存活的块的大小组合
-#     相同**——allocator 按大小从 free list 找最佳匹配。我们的多图方案里 N 张图
-#     跑的是同一段 one_decode_step()，只有 autotune config 不同，存活模式完全
-#     一致，才能拿到干净的 1/N。给结构不同的图（比如 prefill 图和 decode 图）
-#     共享池，只能「共用一片区域各取所需」，不保证省这么多。
+#     注意它并不"识别同一个变量". 地址重合的条件是**同时存活的块的大小组合
+#     相同** -- allocator 按大小从 free list 找最佳匹配. 我们的多图方案里 N 张图
+#     跑的是同一段 one_decode_step(), 只有 autotune config 不同, 存活模式完全
+#     一致, 才能拿到干净的 1/N. 给结构不同的图(比如 prefill 图和 decode 图)
+#     共享池, 只能"共用一片区域各取所需", 不保证省这么多.
 #
-# 代价：两张图的中间量物理上是同一块内存。所以
+# 代价: 两张图的中间量物理上是同一块内存. 所以
 #
-#     **replay 之后必须先把结果拷到池外，才能 replay 同池的另一张图。**
+#     **replay 之后必须先把结果拷到池外, 才能 replay 同池的另一张图. **
 #
-#     独立池：图A 的中间量活到「图A 下次被 replay」
-#     共享池：图A 的中间量活到「同池任意一张图被 replay」
+#     独立池: 图A 的中间量活到"图A 下次被 replay"
+#     共享池: 图A 的中间量活到"同池任意一张图被 replay"
 #
-# 实测 replay 图1 得 1024、随后 replay 图2 得 2048，目标张量只剩最后一次的值。
-# 所以 one_decode_step() 里那句 `o.copy_(...)` 不是可有可无的，是共享池方案的
-# 必要条件。「不能并发 replay」只是这条约束的一个特例（并发时窗口直接归零）。
-# decode 严格串行、且每步都 copy 出去，两条都满足。
+# 实测 replay 图1 得 1024, 随后 replay 图2 得 2048, 目标张量只剩最后一次的值.
+# 所以 one_decode_step() 里那句 `o.copy_(...)` 不是可有可无的, 是共享池方案的
+# 必要条件. "不能并发 replay"只是这条约束的一个特例(并发时窗口直接归零).
+# decode 严格串行, 且每步都 copy 出去, 两条都满足.
 # ===========================================================================
 
 
 def allocate_position(device="cuda") -> torch.Tensor:
-    """[1] INT64，保存"已缓存的 token 数"（= past_len），**必须放在显存里**。
+    """[1] INT64, 保存"已缓存的 token 数"(= past_len), **必须放在显存里**.
 
-    为什么不用 python int：CUDA Graph 在 capture 时会把标量参数和切片下标烧进
-    launch 配置，replay 时永远用 capture 那一刻的值。实测对照——
+    为什么不用 python int: CUDA Graph 在 capture 时会把标量参数和切片下标烧进
+    launch 配置, replay 时永远用 capture 那一刻的值. 实测对照 --
 
-        cache[:, past_len, :] = k_new   （past_len 是 python int）
+        cache[:, past_len, :] = k_new   (past_len 是 python int)
             replay 三次都写第 0 行
-        cache.index_copy_(1, pos, k_new)（pos 是显存张量）
+        cache.index_copy_(1, pos, k_new)(pos 是显存张量)
             replay 三次分别写第 0/1/2 行
 
-    dtype 用 INT64 是因为 index_copy_ 要求 index 为 long；kernel 里 load 之后
-    立刻 .to(tl.int32)，避免后续 int64 运算。
+    dtype 用 INT64 是因为 index_copy_ 要求 index 为 long; kernel 里 load 之后
+    立刻 .to(tl.int32), 避免后续 int64 运算.
 
-    **图内自增**：把 `pos.add_(1)` 也捕获进图，每次 replay 位置自动前进，
-    host 侧一行都不用碰。注意这让图变成有状态的——换 prompt 或 prefill 之后
-    必须显式 `pos.zero_()` 复位；capture 过程本身（warmup + 正式捕获）也会把
-    pos 推进好几格，捕获完同样要复位。
+    **图内自增**: 把 `pos.add_(1)` 也捕获进图, 每次 replay 位置自动前进,
+    host 侧一行都不用碰. 注意这让图变成有状态的 -- 换 prompt 或 prefill 之后
+    必须显式 `pos.zero_()` 复位; capture 过程本身(warmup + 正式捕获)也会把
+    pos 推进好几格, 捕获完同样要复位.
     """
     return torch.zeros(1, dtype=torch.int64, device=device)
 
 
 def _as_position(past_len, device) -> torch.Tensor:
-    """int 或张量 -> [1] INT64 显存张量。
+    """int 或张量 -> [1] INT64 显存张量.
 
-    传 int 时会临时分配并做一次 host->device 拷贝，**只适合测试和非 graph 路径**；
-    真实 runner 应该持有一个 allocate_position() 的张量全程复用。
+    传 int 时会临时分配并做一次 host->device 拷贝, **只适合测试和非 graph 路径**;
+    真实 runner 应该持有一个 allocate_position() 的张量全程复用.
     """
     if isinstance(past_len, torch.Tensor):
         assert past_len.dtype == torch.int64 and past_len.numel() == 1
@@ -507,9 +507,9 @@ def allocate_kv_cache(
     head_dim: int,
     device="cuda",
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """整块预分配 [H_kv, T_max, D] 的 K/V cache。
+    """整块预分配 [H_kv, T_max, D] 的 K/V cache.
 
-    K 和 V 分成两个张量而不是合并成 [2,H,T,D]：少一层 stride，接口更直白。
+    K 和 V 分成两个张量而不是合并成 [2,H,T,D]: 少一层 stride, 接口更直白.
     """
     shape = (num_kv_heads, max_len, head_dim)
     return (
@@ -523,9 +523,9 @@ def kv_cache_from_prefill(
     v: torch.Tensor,
     max_len: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """prefill 的 K/V `[H_kv, T, D]`（RoPE 之后）-> 预分配好的 cache。
+    """prefill 的 K/V `[H_kv, T, D]`(RoPE 之后)-> 预分配好的 cache.
 
-    prefill 那边拿到的通常是 `[1,H_kv,T,D]`，squeeze 掉 batch 维再传进来。
+    prefill 那边拿到的通常是 `[1,H_kv,T,D]`, squeeze 掉 batch 维再传进来.
     """
     num_kv_heads, token_num, head_dim = k.shape
     assert v.shape == k.shape
@@ -544,7 +544,7 @@ def _torch_reference(
     v_cache: torch.Tensor,
     seq_len: int,
 ) -> torch.Tensor:
-    """q `[H_q,D]`，cache `[H_kv,T_max,D]` -> out `[H_q,D]`。FP32 softmax。"""
+    """q `[H_q,D]`, cache `[H_kv,T_max,D]` -> out `[H_q,D]`. FP32 softmax."""
     num_q_heads, head_dim = q.shape
     num_kv_heads = k_cache.shape[0]
     group = num_q_heads // num_kv_heads
@@ -555,51 +555,51 @@ def _torch_reference(
 
     out = torch.empty((num_q_heads, head_dim), dtype=torch.float32, device=q.device)
     for h in range(num_q_heads):
-        hk = h // group  # GQA：不复制 K/V，直接映射
-        score = (k[hk] @ q32[h]) * (head_dim**-0.5)  # [S]，无需 causal mask
+        hk = h // group  # GQA: 不复制 K/V, 直接映射
+        score = (k[hk] @ q32[h]) * (head_dim**-0.5)  # [S], 无需 causal mask
         prob = torch.softmax(score, dim=-1)
         out[h] = prob @ v[hk]
     return out.to(q.dtype)
 
 
 # ===========================================================================
-# split-K 版本：把 T 切成 MAX_SPLITS 段并行算，再用第二个 kernel 归约
+# split-K 版本: 把 T 切成 MAX_SPLITS 段并行算, 再用第二个 kernel 归约
 # ===========================================================================
 #
 # 为什么是两个 kernel 而不是 tl.atomic_add
 # ---------------------------------------
-# online softmax 的归约不是简单求和：acc 和 l 都要先按**全局** max 重新缩放才能相加。
-# atomic_add 只能无条件累加；就算用 atomic_max 求出全局 m，此前已累加进去的 acc
-# 是按旧 max 缩放的，事后无法追溯修正——要修正就得再扫一遍，那本质就是第二个 kernel。
+# online softmax 的归约不是简单求和: acc 和 l 都要先按**全局** max 重新缩放才能相加.
+# atomic_add 只能无条件累加; 就算用 atomic_max 求出全局 m, 此前已累加进去的 acc
+# 是按旧 max 缩放的, 事后无法追溯修正 -- 要修正就得再扫一遍, 那本质就是第二个 kernel.
 #
-# 唯一能让 atomic 成立的办法是放弃减 max、直接算 exp(s) 再纯加。数学上可行，
-# 但丢掉数值稳定性（fp32 里 exp(s) 在 s>88 溢出），而这正是 online softmax 要消除的
-# 隐患。另外 atomic 的累加顺序不定会破坏结果可复现性，而本项目的验收方法
-# （逐算子对拍 + 分叉步的 top-2 间距）依赖确定性。
+# 唯一能让 atomic 成立的办法是放弃减 max, 直接算 exp(s) 再纯加. 数学上可行,
+# 但丢掉数值稳定性(fp32 里 exp(s) 在 s>88 溢出), 而这正是 online softmax 要消除的
+# 隐患. 另外 atomic 的累加顺序不定会破坏结果可复现性, 而本项目的验收方法
+# (逐算子对拍 + 分叉步的 top-2 间距)依赖确定性.
 #
 # num_splits 为什么恒等于 MAX_SPLITS
 # ----------------------------------
-# 更多 split 没有收益——CTA 数过了 ~432 带宽就饱和了（见模块 docstring 的实测表），
-# 所以 split 数天然有上界。固定成常数还有个更强的理由：**cudagraph 要求 grid 在
-# capture 时固定**，而 cudagraph 是把 CPU 开销归零的唯一途径。
-# num_splits 随 seq_len 变的话每步都要重新 capture，等于白做。
+# 更多 split 没有收益 -- CTA 数过了 ~432 带宽就饱和了(见模块 docstring 的实测表),
+# 所以 split 数天然有上界. 固定成常数还有个更强的理由: **cudagraph 要求 grid 在
+# capture 时固定**, 而 cudagraph 是把 CPU 开销归零的唯一途径.
+# num_splits 随 seq_len 变的话每步都要重新 capture, 等于白做.
 #
-# 于是 scratch buffer 也是定长的，不随 token 数增长：
+# 于是 scratch buffer 也是定长的, 不随 token 数增长:
 #
 #     m_partial   [H_q, MAX_SPLITS]      FP32     4 KB
 #     l_partial   [H_q, MAX_SPLITS]      FP32     4 KB
 #     acc_partial [H_q, MAX_SPLITS, D]   FP32     1 MB
 #
-# 构造 runner 时分配一次，6 层和所有 decode step 全程复用。seq_len 增长时变的是
-# 每个 split 内部循环的长度（chunk = cdiv(seq_len, MAX_SPLITS)），不是 buffer 大小。
-# 这与 KV cache 本身预分配到 T_max 是同一个思路。
+# 构造 runner 时分配一次, 6 层和所有 decode step 全程复用. seq_len 增长时变的是
+# 每个 split 内部循环的长度(chunk = cdiv(seq_len, MAX_SPLITS)), 不是 buffer 大小.
+# 这与 KV cache 本身预分配到 T_max 是同一个思路.
 #
-# 代价：seq_len 小时大部分 split 空转。**处理方式是完全不用分支**：
-# `tl.range(start, end, BLOCK_T)` 在 start >= end 时零次迭代，循环体不执行；
-# store 无条件做，写的就是初始值 m=-inf, l=0, acc=0，正是空 split 应有的值。
-# combine 里 exp(-inf - m) = 0，这些 split 自动贡献 0，不需要特判。
+# 代价: seq_len 小时大部分 split 空转. **处理方式是完全不用分支**:
+# `tl.range(start, end, BLOCK_T)` 在 start >= end 时零次迭代, 循环体不执行;
+# store 无条件做, 写的就是初始值 m=-inf, l=0, acc=0, 正是空 split 应有的值.
+# combine 里 exp(-inf - m) = 0, 这些 split 自动贡献 0, 不需要特判.
 #
-# 实测过"用 if 包住 store 以跳过空 split 的写"，结论是不要这么做：
+# 实测过"用 if 包住 store 以跳过空 split 的写", 结论是不要这么做:
 #
 #     seq_len   活跃split   无条件 store   if 包住 store     差异
 #           7          7        4.74us       4.73us       0.1%
@@ -607,12 +607,12 @@ def _torch_reference(
 #        1024        128        9.24us       9.21us       0.4%
 #        8192        128       14.14us      14.15us      -0.0%
 #
-# seq_len=128 时所有 split 都活跃、分支恒为真，if 版仍慢 26%——分支本身干扰了
-# codegen；而它想省的写流量在 seq_len=7 上根本没测出收益。
+# seq_len=128 时所有 split 都活跃, 分支恒为真, if 版仍慢 26% -- 分支本身干扰了
+# codegen; 而它想省的写流量在 seq_len=7 上根本没测出收益.
 #
-# chunk 和 seq_len 都是**运行时标量**，不要做成 tl.constexpr——它们随 seq_len 变，
-# 做成 constexpr 就是每个取值触发一次重编译（T_BUCKET 跨桶那几十秒已经吃过一次）。
-# 只有 MAX_SPLITS（用于 buffer 索引的上界）是 constexpr。
+# chunk 和 seq_len 都是**运行时标量**, 不要做成 tl.constexpr -- 它们随 seq_len 变,
+# 做成 constexpr 就是每个取值触发一次重编译(T_BUCKET 跨桶那几十秒已经吃过一次).
+# 只有 MAX_SPLITS(用于 buffer 索引的上界)是 constexpr.
 
 MAX_SPLITS = 128
 
@@ -628,20 +628,20 @@ split_autotune_configs = [
 @triton.autotune(
     configs=split_autotune_configs,
     key=["H_Q", "D", "GROUP", "S_BUCKET"],
-    # 不需要 restore_value：kernel 只写 scratch，且每次写的值相同（幂等）。
-    # 与 conv4_decode / gdn_recurrent_decode 不同——那两个的 state 会向前推进，
-    # autotune 反复试 config 会把状态推多次，所以必须 restore。
+    # 不需要 restore_value: kernel 只写 scratch, 且每次写的值相同(幂等).
+    # 与 conv4_decode / gdn_recurrent_decode 不同 -- 那两个的 state 会向前推进,
+    # autotune 反复试 config 会把状态推多次, 所以必须 restore.
 )
 @triton.jit
 def _gqa_attention_decode_split_triton(
     q_ptr,  # [H_q, D] BF16
     stride_q_h: tl.constexpr,
     stride_q_d: tl.constexpr,
-    k_cache_ptr,  # [H_kv, T_max, D] BF16，只读
+    k_cache_ptr,  # [H_kv, T_max, D] BF16, 只读
     stride_kc_h: tl.constexpr,
     stride_kc_t: tl.constexpr,
     stride_kc_d: tl.constexpr,
-    v_cache_ptr,  # [H_kv, T_max, D] BF16，只读
+    v_cache_ptr,  # [H_kv, T_max, D] BF16, 只读
     stride_vc_h: tl.constexpr,
     stride_vc_t: tl.constexpr,
     stride_vc_d: tl.constexpr,
@@ -655,7 +655,7 @@ def _gqa_attention_decode_split_triton(
     stride_ap_h: tl.constexpr,
     stride_ap_s: tl.constexpr,
     stride_ap_d: tl.constexpr,
-    pos_ptr,  # [1] INT64，理由同不切 T 的版本
+    pos_ptr,  # [1] INT64, 理由同不切 T 的版本
     scale,
     H_Q: tl.constexpr,
     D: tl.constexpr,
@@ -665,8 +665,8 @@ def _gqa_attention_decode_split_triton(
     BLOCK_T: tl.constexpr,
 ):
 
-    # seq_len 和 chunk 都在 kernel 内从 pos 算出来，host 侧一个都不用传——
-    # 传标量的话 CUDA Graph replay 会用 capture 时的旧值。理由详见不切 T 的版本。
+    # seq_len 和 chunk 都在 kernel 内从 pos 算出来, host 侧一个都不用传 --
+    # 传标量的话 CUDA Graph replay 会用 capture 时的旧值. 理由详见不切 T 的版本.
     seq_len = tl.load(pos_ptr).to(tl.int32) + 1
     chunk = (seq_len + MAX_SPLITS_C - 1) // MAX_SPLITS_C
 
@@ -709,7 +709,7 @@ def _gqa_attention_decode_split_triton(
         acc = acc * alpha[:, None] + tl.dot(p.to(tl.bfloat16), v)
         l_i = l_i * alpha + tl.sum(p, axis=1)
         m_i = m_i_new
-    
+
     tl.store(
         m_partial_ptr + offset_h * stride_mp_h + pid_s * stride_mp_s, m_i
     )
@@ -746,17 +746,17 @@ def _gqa_attention_decode_combine_triton(
     out_ptr,  # [H_q, D] BF16
     stride_o_h: tl.constexpr,
     stride_o_d: tl.constexpr,
-    pos_ptr,  # [1] INT64，num_active 由它算出，理由同 split kernel
+    pos_ptr,  # [1] INT64, num_active 由它算出, 理由同 split kernel
     D: tl.constexpr,
     MAX_SPLITS_C: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
     # H_q维度上肯定可以切 但是这么点CTA肯定吃不满sm
-    # 在D维度上也进行切分 主要是增加m和l的读取量 但是m l本身很小 L2cache完全可以兜住 代价很小 
+    # 在D维度上也进行切分 主要是增加m和l的读取量 但是m l本身很小 L2cache完全可以兜住 代价很小
 
-    # num_active 必须与 split kernel 用同一个 pos 算，否则两边对"哪些 split 有效"的
-    # 理解会不一致，读到上一次残留的局部量。这里刻意重算而不是从 host 传，
-    # 就是为了消除这个不一致的可能。
+    # num_active 必须与 split kernel 用同一个 pos 算, 否则两边对"哪些 split 有效"的
+    # 理解会不一致, 读到上一次残留的局部量. 这里刻意重算而不是从 host 传,
+    # 就是为了消除这个不一致的可能.
     seq_len = tl.load(pos_ptr).to(tl.int32) + 1
     chunk = (seq_len + MAX_SPLITS_C - 1) // MAX_SPLITS_C
     num_active = (seq_len + chunk - 1) // chunk
@@ -767,7 +767,7 @@ def _gqa_attention_decode_combine_triton(
 
     m_all = tl.load(
         m_partial_ptr + pid_h * stride_mp_h + offset_s * stride_mp_s,
-        mask = offset_s < num_active, 
+        mask = offset_s < num_active,
         other = -float('inf')
     ) # [MAX_SPLITS]
     l_all = tl.load(
@@ -784,10 +784,10 @@ def _gqa_attention_decode_combine_triton(
     m = tl.max(m_all, axis = -1) # 单独head下这是一个标量单值
     alpha = tl.exp(m_all - m) # [MAX_SPLITS]
     l = tl.sum(l_all * alpha, axis = -1) # 单独head下这是一个标量单值
-    
+
     acc_all = tl.sum(acc_all * alpha[:, None], axis = 0) # [D]
     acc_all /= l
-    
+
     tl.store(
         out_ptr + pid_h * stride_o_h + offset_d * stride_o_d,
         acc_all.to(out_ptr.dtype.element_ty)
@@ -818,8 +818,8 @@ def gqa_attention_decode_split(
     assert m_partial.dtype == l_partial.dtype == acc_partial.dtype == torch.float32
     assert pos.dtype == torch.int64 and pos.numel() == 1
 
-    # 追加与不切 T 的版本同理：放在 wrapper 里，且用 index_copy_ 而非 python int 下标，
-    # 这样 CUDA Graph replay 时写入位置才会跟着 pos 走。
+    # 追加与不切 T 的版本同理: 放在 wrapper 里, 且用 index_copy_ 而非 python int 下标,
+    # 这样 CUDA Graph replay 时写入位置才会跟着 pos 走.
     k_cache.index_copy_(1, pos, k_new.unsqueeze(1))
     v_cache.index_copy_(1, pos, v_new.unsqueeze(1))
 
@@ -853,7 +853,7 @@ def gqa_attention_decode_split(
         D=head_dim,
         GROUP=num_q_heads // num_kv_heads,
         MAX_SPLITS_C=MAX_SPLITS,
-        S_BUCKET=_seq_bucket(seq_bucket),  # 仅影响 config 选择，不参与计算
+        S_BUCKET=_seq_bucket(seq_bucket),  # 仅影响 config 选择, 不参与计算
     )
 
 
@@ -912,9 +912,9 @@ def _gqa_attention_decode_combine_fake(m_partial, l_partial, acc_partial, pos):
 def allocate_split_scratch(
     num_q_heads: int, head_dim: int, device="cuda"
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """定长 scratch，构造 runner 时分配一次，所有层和所有 decode step 复用。
+    """定长 scratch, 构造 runner 时分配一次, 所有层和所有 decode step 复用.
 
-    大小只与 MAX_SPLITS 有关，**不随 token 数增长**。
+    大小只与 MAX_SPLITS 有关, **不随 token 数增长**.
     """
     f32 = dict(dtype=torch.float32, device=device)
     return (
@@ -933,9 +933,9 @@ def call_gqa_attention_decode_split_triton(
     past_len,
     scratch: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
 ) -> torch.Tensor:
-    """接口与不切 T 的 `call_gqa_attention_decode_triton` 一致，可直接互换。
+    """接口与不切 T 的 `call_gqa_attention_decode_triton` 一致, 可直接互换.
 
-    scratch 传 None 时临时分配——**只用于测试**，实际 runner 应该复用一份。
+    scratch 传 None 时临时分配 -- **只用于测试**, 实际 runner 应该复用一份.
     """
     if scratch is None:
         scratch = allocate_split_scratch(q.shape[0], q.shape[1], device=q.device)
@@ -945,8 +945,8 @@ def call_gqa_attention_decode_split_triton(
     gqa_attention_decode_split(
         q, k_new, v_new, k_cache, v_cache, m_partial, l_partial, acc_partial, pos, hint
     )
-    # combine 自己从同一个 pos 算 num_active，不从 host 传——两边必须用同一个来源，
-    # 否则对"哪些 split 有效"的理解可能不一致。
+    # combine 自己从同一个 pos 算 num_active, 不从 host 传 -- 两边必须用同一个来源,
+    # 否则对"哪些 split 有效"的理解可能不一致.
     return gqa_attention_decode_combine(m_partial, l_partial, acc_partial, pos)
 
 
@@ -956,9 +956,9 @@ def _torch_reference_split(
     v_cache: torch.Tensor,
     seq_len: int,
 ) -> torch.Tensor:
-    """按 MAX_SPLITS 分段算局部量再归约的 PyTorch 参考实现。
+    """按 MAX_SPLITS 分段算局部量再归约的 PyTorch 参考实现.
 
-    结果必须与 `_torch_reference` 完全一致——这条本身就是对归约公式的自检。
+    结果必须与 `_torch_reference` 完全一致 -- 这条本身就是对归约公式的自检.
     """
     num_q_heads, head_dim = q.shape
     group = num_q_heads // k_cache.shape[0]
@@ -1004,9 +1004,9 @@ if __name__ == "__main__":
     MAX_LEN = 512
 
     def run_prefill_then_decode(token_num, prefix, decode_fn):
-        """prefill 前 prefix 个 token，再逐 token decode 剩下的，拼成完整输出。
+        """prefill 前 prefix 个 token, 再逐 token decode 剩下的, 拼成完整输出.
 
-        判据是它必须等于对整段直接做 causal prefill 的结果。
+        判据是它必须等于对整段直接做 causal prefill 的结果.
         """
         q = torch.randn((1, H_Q, token_num, D), dtype=torch.bfloat16, device="cuda")
         k = torch.randn((1, H_KV, token_num, D), dtype=torch.bfloat16, device="cuda")
@@ -1042,16 +1042,16 @@ if __name__ == "__main__":
         v_cache[:, past_len, :] = v_new
         return _torch_reference(q, k_cache, v_cache, past_len + 1)
 
-    # ---- 第 1 步：参考实现 vs prefill kernel（不依赖 Triton kernel，现在就能跑）----
+    # ---- 第 1 步: 参考实现 vs prefill kernel(不依赖 Triton kernel, 现在就能跑)----
     print("=== 参考实现 vs prefill kernel ===")
     for token_num, prefix in ((1, 0), (2, 1), (17, 5), (65, 33), (129, 64)):
         actual, expected = run_prefill_then_decode(token_num, prefix, _reference_decode)
         err = (actual.float() - expected.float()).abs().max().item()
         torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
         print(f"  T={token_num:>4} prefix={prefix:>3}  max_abs_error={err:.8f}")
-    print("参考实现与 prefill kernel 一致。\n")
+    print("参考实现与 prefill kernel 一致. \n")
 
-    # ---- 第 2 步：Triton kernel vs 参考实现 -------------------------------
+    # ---- 第 2 步: Triton kernel vs 参考实现 -------------------------------
     print("=== Triton kernel vs 参考实现 ===")
     for token_num, prefix in ((1, 0), (17, 5), (65, 33), (129, 64), (257, 128)):
         actual, expected = run_prefill_then_decode(
@@ -1065,7 +1065,7 @@ if __name__ == "__main__":
             f"best_config={_gqa_attention_decode_triton.best_config}"
         )
 
-    # cache 里 past_len 之后的位置不该被读到：填成 NaN 也必须不影响结果
+    # cache 里 past_len 之后的位置不该被读到: 填成 NaN 也必须不影响结果
     q = torch.randn((H_Q, D), dtype=torch.bfloat16, device="cuda")
     k_new = torch.randn((H_KV, D), dtype=torch.bfloat16, device="cuda")
     v_new = torch.randn_like(k_new)
@@ -1078,11 +1078,11 @@ if __name__ == "__main__":
     dirty = call_gqa_attention_decode_triton(q, k_new, v_new, k_cache, v_cache, 10)
     torch.testing.assert_close(clean, dirty)
     assert torch.isfinite(dirty).all()
-    print("  cache 尾部填 NaN 不影响结果（越界保护正确）")
+    print("  cache 尾部填 NaN 不影响结果(越界保护正确)")
 
-    # ---- 第 3 步：split-K 的归约公式自检（不依赖 Triton kernel）-----------
-    # 分段算局部量再归约，必须与一次性算完全一致。这条能抓住 m/l 重缩放写错。
-    print("\n=== split-K 归约公式 vs 一次性算（纯 PyTorch）===")
+    # ---- 第 3 步: split-K 的归约公式自检(不依赖 Triton kernel)-----------
+    # 分段算局部量再归约, 必须与一次性算完全一致. 这条能抓住 m/l 重缩放写错.
+    print("\n=== split-K 归约公式 vs 一次性算(纯 PyTorch)===")
     for seq_len in (1, 7, 64, 65, 200, 511):
         q = torch.randn((H_Q, D), dtype=torch.bfloat16, device="cuda")
         kc, vc = allocate_kv_cache(H_KV, MAX_LEN, D)
@@ -1094,10 +1094,10 @@ if __name__ == "__main__":
         torch.testing.assert_close(a, b, rtol=1e-2, atol=1e-2)
         active = min(MAX_SPLITS, -(-seq_len // (-(-seq_len // MAX_SPLITS))))
         print(f"  seq_len={seq_len:>4} 活跃split={active:>4}/{MAX_SPLITS}  max_abs_error={err:.8f}")
-    print("归约公式正确。\n")
+    print("归约公式正确. \n")
 
-    # ---- 第 4 步：split-K Triton kernel vs 不切 T 的版本 ------------------
-    # 不切 T 的版本已经对过 prefill kernel，这里拿它当基准。
+    # ---- 第 4 步: split-K Triton kernel vs 不切 T 的版本 ------------------
+    # 不切 T 的版本已经对过 prefill kernel, 这里拿它当基准.
     print("=== split-K kernel vs 不切 T 的版本 ===")
     try:
         for token_num, prefix in ((1, 0), (17, 5), (65, 33), (129, 64), (257, 128)):
@@ -1112,8 +1112,8 @@ if __name__ == "__main__":
                 f"split_cfg={_gqa_attention_decode_split_triton.best_config}"
             )
 
-        # 空 split 必须写零值而不是留下上一次的残留：先用长序列填脏 scratch，
-        # 再用短序列跑，结果必须正确。
+        # 空 split 必须写零值而不是留下上一次的残留: 先用长序列填脏 scratch,
+        # 再用短序列跑, 结果必须正确.
         scratch = allocate_split_scratch(H_Q, D)
         q = torch.randn((H_Q, D), dtype=torch.bfloat16, device="cuda")
         kn = torch.randn((H_KV, D), dtype=torch.bfloat16, device="cuda")
@@ -1128,11 +1128,11 @@ if __name__ == "__main__":
         short = call_gqa_attention_decode_split_triton(q, kn, vn, kc2, vc2, 5, scratch)
         ref = _torch_reference(q, kc2, vc2, 6)
         torch.testing.assert_close(short, ref, rtol=2e-2, atol=2e-2)
-        print("  脏 scratch 复用后短序列仍正确（空 split 确实写了零值）")
+        print("  脏 scratch 复用后短序列仍正确(空 split 确实写了零值)")
 
-        # ---- 第 5 步：CUDA Graph 捕获 + 连续 replay ----------------------
-        # 这是整套显存标量改造的真正判据：图捕获一次，之后每步只 replay，
-        # 位置靠图内的 pos.add_(1) 自动前进，host 侧不碰任何标量。
+        # ---- 第 5 步: CUDA Graph 捕获 + 连续 replay ----------------------
+        # 这是整套显存标量改造的真正判据: 图捕获一次, 之后每步只 replay,
+        # 位置靠图内的 pos.add_(1) 自动前进, host 侧不碰任何标量.
         print("\n=== CUDA Graph capture + replay ===")
         token_num, prefix = 40, 8
         q_all = torch.randn((1, H_Q, token_num, D), dtype=torch.bfloat16, device="cuda")
@@ -1145,7 +1145,7 @@ if __name__ == "__main__":
         )
         scratch = allocate_split_scratch(H_Q, D)
         pos = allocate_position()
-        # 输入槽：图捕获的是"读这几个固定地址"，每步只更新内容
+        # 输入槽: 图捕获的是"读这几个固定地址", 每步只更新内容
         q_slot = torch.empty((H_Q, D), dtype=torch.bfloat16, device="cuda")
         k_slot = torch.empty((H_KV, D), dtype=torch.bfloat16, device="cuda")
         v_slot = torch.empty_like(k_slot)
@@ -1156,9 +1156,9 @@ if __name__ == "__main__":
                 q_slot, k_slot, v_slot, kc, vc, pos, scratch
             )
             out_slot.copy_(o)
-            pos.add_(1)  # 图内自增：replay 时位置自动前进
+            pos.add_(1)  # 图内自增: replay 时位置自动前进
 
-        # 捕获前先 warmup（Triton JIT / autotune 必须在捕获之外完成）
+        # 捕获前先 warmup(Triton JIT / autotune 必须在捕获之外完成)
         q_slot.copy_(q_all[0, :, prefix, :])
         k_slot.copy_(k_all[0, :, prefix, :])
         v_slot.copy_(v_all[0, :, prefix, :])
@@ -1177,8 +1177,8 @@ if __name__ == "__main__":
         with torch.cuda.graph(graph):
             one_step()
 
-        # 捕获过程本身把 pos 推进了好几格、也污染了 cache，必须复位。
-        # 这是"图有状态"的直接后果，真实 runner 要有显式的 reset。
+        # 捕获过程本身把 pos 推进了好几格, 也污染了 cache, 必须复位.
+        # 这是"图有状态"的直接后果, 真实 runner 要有显式的 reset.
         pos.zero_()
         kc.zero_()
         vc.zero_()
@@ -1195,21 +1195,21 @@ if __name__ == "__main__":
             q_slot.copy_(q_all[0, :, t, :])
             k_slot.copy_(k_all[0, :, t, :])
             v_slot.copy_(v_all[0, :, t, :])
-            graph.replay()  # host 侧只有这一次调用，不传任何标量
+            graph.replay()  # host 侧只有这一次调用, 不传任何标量
             parts.append(out_slot.clone().unsqueeze(1))
         actual = torch.cat(parts, dim=1)
 
         err = (actual.float() - expected.float()).abs().max().item()
         torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
-        assert int(pos.item()) == token_num, f"pos 应前进到 {token_num}，实际 {pos.item()}"
-        print(f"  捕获 1 次，replay {token_num - prefix} 次，pos 自动 {prefix} -> {pos.item()}")
-        print(f"  与整段 causal prefill 一致，max_abs_error={err:.8f}")
+        assert int(pos.item()) == token_num, f"pos 应前进到 {token_num}, 实际 {pos.item()}"
+        print(f"  捕获 1 次, replay {token_num - prefix} 次, pos 自动 {prefix} -> {pos.item()}")
+        print(f"  与整段 causal prefill 一致, max_abs_error={err:.8f}")
 
         print("All GQA attention decode split-K tests passed.")
     except NotImplementedError as exc:
-        print(f"  跳过：{exc}")
+        print(f"  跳过: {exc}")
     except Exception as exc:
         if "静态" in str(exc) or "static_assert" in str(exc).lower():
             raise
-        print(f"  split-K kernel 尚未实现或有误：{type(exc).__name__}: {str(exc)[:160]}")
-        print("  填完两个 body 后重跑本文件。")
+        print(f"  split-K kernel 尚未实现或有误: {type(exc).__name__}: {str(exc)[:160]}")
+        print("  填完两个 body 后重跑本文件.")

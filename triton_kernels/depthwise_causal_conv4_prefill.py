@@ -19,16 +19,16 @@ autotune_configs = [
     configs=autotune_configs,
     key=["D", "T_BUCKET"],
 )
-@triton.jit 
+@triton.jit
 def _depthwise_causal_conv4_prefill_kernel(
     x_ptr, # [T, 6144]  BF16
-    stride_x_t, stride_x_d, 
-    weight_ptr, # [6144, 4] BF16, 
+    stride_x_t, stride_x_d,
+    weight_ptr, # [6144, 4] BF16,
     stride_weight_d: tl.constexpr, stride_weight_k: tl.constexpr,
-    out_ptr, # [T, 6144] BF16, 
+    out_ptr, # [T, 6144] BF16,
     stride_out_t, stride_out_d,
-    T: int, 
-    D: int, 
+    T: int,
+    D: int,
     T_BUCKET: tl.constexpr,
     BLOCK_T: tl.constexpr, BLOCK_D: tl.constexpr,
 ):
@@ -39,12 +39,12 @@ def _depthwise_causal_conv4_prefill_kernel(
     offset_t = pid_t * BLOCK_T + tl.arange(0, BLOCK_T)
     offset_k = tl.arange(0, 4)
 
-    input_t = offset_t[None, :, None] + offset_k[:, None, None] - 3 
-    x_offsets = input_t * stride_x_t + offset_d[None, None, :] * stride_x_d 
+    input_t = offset_t[None, :, None] + offset_k[:, None, None] - 3
+    x_offsets = input_t * stride_x_t + offset_d[None, None, :] * stride_x_d
     x_mask = (
         (offset_t[None, :, None] < T) &
-        (input_t >= 0) & 
-        (input_t < T) & 
+        (input_t >= 0) &
+        (input_t < T) &
         (offset_d[None, None, :] < D)
     )
     x = tl.load(
@@ -55,7 +55,7 @@ def _depthwise_causal_conv4_prefill_kernel(
 
     # 载入weight weight在第二维度上进行广播
     w = tl.load(
-        weight_ptr + offset_d[None, None, :] * stride_weight_d + offset_k[:, None, None] * stride_weight_k, 
+        weight_ptr + offset_d[None, None, :] * stride_weight_d + offset_k[:, None, None] * stride_weight_k,
         mask=offset_d[None, None, :] < D,
         other=0.0,
     ).to(tl.float32)
