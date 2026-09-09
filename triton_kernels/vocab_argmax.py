@@ -4,9 +4,30 @@ import triton
 import triton.language as tl
 
 
+def _batch_bucket(batch: int) -> int:
+    """B 直接进 autotune key 的话每换一个 batch 就重调, 分桶."""
+    if batch == 1:
+        return 1
+    if batch <= 4:
+        return 4
+    if batch <= 16:
+        return 16
+    if batch <= 64:
+        return 64
+    return 65
+
+
+stage1_autotune_configs = [
+    triton.Config({"BLOCK_B": bb}, num_warps=w, num_stages=1)
+    for bb in (1, 2, 4, 8, 16, 32)
+    for w in (2, 4)
+]
+
+
+@triton.autotune(configs=stage1_autotune_configs, key=["HIDDEN_SIZE", "B_BUCKET"])
 @triton.jit
 def _lm_head_argmax_stage1_triton(
-    hidden_ptr,  # [T, HIDDEN_SIZE] BF16
+    hidden_ptr,  # [B, HIDDEN_SIZE] BF16
     stride_hidden_t: tl.constexpr,
     weight_ptr,  # [VOCAB_SIZE, HIDDEN_SIZE] BF16
     stride_w_vocab: tl.constexpr,
@@ -15,55 +36,70 @@ def _lm_head_argmax_stage1_triton(
     stride_pv_b: tl.constexpr,
     partial_indices_ptr,  # [B, ceil_div(VOCAB_SIZE, GROUP_V)] INT32
     stride_pi_b: tl.constexpr,
-    row_stride,  # 每个 program 负责的 hidden 行间隔; 见下
+    row_stride,  # 相邻 batch 行的间隔; 见下
+    BATCH,  # 实际的 B, 用来 mask 掉 BLOCK_B 补齐出来的那几行
     VOCAB_SIZE: tl.constexpr,  # 248320
     HIDDEN_SIZE: tl.constexpr,  # 1024
     GROUP_V: tl.constexpr,  # 每个 program 负责的词表范围, 建议 512
     TILE_V: tl.constexpr,  # program 内每次计算的词表子块, 建议 8/16/32
     TILE_K: tl.constexpr,  # GEMV reduction 子块, 建议 128/256
+    B_BUCKET: tl.constexpr,  # 只用于 autotune 选 config, 不参与计算
+    BLOCK_B: tl.constexpr,  # 一个 program 同时处理几行 query
 ):
-    # 248320 = 485 * 512. 每个 program 计算 GROUP_V 个 logits,
-    # 输出一个局部最大值及其全局 token index.
+    # 248320 = 485 * 512. 每个 program 负责 GROUP_V 个词表项 x BLOCK_B 行 query,
+    # 输出这段词表里的局部最大值及其全局 token index, 每行一个.
     #
-    # grid = (B, num_partials). 两种调用方式共用这个 kernel:
-    #   prefill  B=1, row_stride = (T-1)*stride_hidden_t, 只取最后一个位置的 logits
-    #   decode   B 条序列各一个 token, row_stride = stride_hidden_t, 第 b 行对应第 b 条
-    # 把"读哪一行"抽成 row_stride 而不是写死 (token_num-1), 两种情形就统一了.
+    # grid = (cdiv(B, BLOCK_B), num_partials). 两种调用方式共用这个 kernel:
+    #   prefill  B=1, hidden 传 hidden[T-1:] 的视图, 只算最后一个位置的 logits
+    #   decode   B 条序列各一个 token, 第 b 行对应第 b 条
+    #
+    # **为什么要 BLOCK_B: 权重复用. **
+    # 原来 grid 的第一维就是 B, 每个 program 只服务一行 query, 于是 485 MiB 的
+    # embedding 被**每条序列各完整读一遍**. 实测 B=1 时 373us(1362 GB/s, 88% 峰值,
+    # 本来写得很好), B=32 时 3977us -- 10.6 倍, 占掉整个 decode step 的 48%.
+    #
+    # 按 BLOCK_B 分块之后, 一个权重 tile 载入一次给 BLOCK_B 行共用, 权重读取次数
+    # 从 B 次降到 cdiv(B, BLOCK_B) 次. BLOCK_B=32 且 B=32 时就是一次.
+    #
+    # 不切 batch 而是"一个 program 吃下全部 B 行"是不行的: B 大了寄存器直接爆
+    # (B=256 时中间量约 37K 个 float). 全局限流或者 if-else 走旧路径都只是把问题
+    # 挡在门外, 分块才是让它优雅降级.
     pid_b, pid = tl.program_id(0), tl.program_id(1)
     start_offset_v = pid * GROUP_V
-    hidden_ptr = hidden_ptr + pid_b * row_stride
-    partial_values_ptr = partial_values_ptr + pid_b * stride_pv_b
-    partial_indices_ptr = partial_indices_ptr + pid_b * stride_pi_b
 
-    local_index = 0
-    local_max = -float('inf')
+    offset_b = pid_b * BLOCK_B + tl.arange(0, BLOCK_B)
+
+    local_index = tl.zeros([BLOCK_B], tl.int32)
+    local_max = tl.zeros([BLOCK_B], tl.float32) - float("inf")
 
     for start_v in tl.range(0, GROUP_V, TILE_V):
         offset_v = start_offset_v + start_v + tl.arange(0, TILE_V)
-        valid_v = offset_v < VOCAB_SIZE
-
-        result = tl.zeros([TILE_V], dtype = tl.float32)
+        result = tl.zeros([BLOCK_B, TILE_V], dtype = tl.float32)
 
         for start_k in tl.range(0, HIDDEN_SIZE, TILE_K):
-            offset_k = start_k + tl.arange(0, TILE_K) # HIDDEN_SIZE一定是TILE_K的整数倍 这里无需mask
-            x = tl.load(hidden_ptr + offset_k[None, :])  # [1, TILE_K]
+            offset_k = start_k + tl.arange(0, TILE_K)
+            x = tl.load(
+                hidden_ptr + offset_b[:, None] * row_stride + offset_k[None, :], 
+                mask = offset_b[:, None] < BATCH, other = 0.0
+            ) # [BLOCK_B, TILE_K]
             w = tl.load(
-                weight_ptr + offset_v[:, None] *  stride_w_vocab + offset_k[None, :] * stride_w_hidden,
-                mask = valid_v[:, None],
-                other = 0.0
-            )
-            result += tl.sum(x.to(tl.float32) * w.to(tl.float32), axis = -1)
+                weight_ptr + offset_v[:, None] * stride_w_vocab + offset_k[None, :] * stride_w_hidden,
+                mask = offset_v[:, None] < VOCAB_SIZE, other = 0.0
+            ) # [TILE_V, TILE_K]
+            result += tl.dot(x, tl.trans(w)) # [BLOCK_B, TILE_V]
+        # 词表尾部补齐出来的项 w 载入是 0, result 也就是 0. 如果这一组里所有真实
+        # logit 都是负数, argmax 会挑中那个补齐项、返回越界的 token id.
+        # 本模型碰不到(248320 = 485 x 512, GROUP_V 正好整除), 但换个词表就会静默出错.
+        result = tl.where(offset_v[None, :] < VOCAB_SIZE, result, -float("inf"))
 
-        result = tl.where(valid_v, result, -float('inf'))
-
-        tile_max = tl.max(result, axis = -1)
+        tile_max = tl.max(result, axis = -1) # [BLOCK_B]
         tile_index = tl.argmax(result, axis = -1) + start_offset_v + start_v
-        take_tile = tile_max > local_max
-        local_max = tl.where(take_tile, tile_max, local_max)
-        local_index = tl.where(take_tile, tile_index, local_index)
+        take = tile_max > local_max
+        local_max = tl.where(take, tile_max, local_max)
+        local_index = tl.where(take, tile_index, local_index)
 
-    tl.store(partial_values_ptr + pid, local_max)
-    tl.store(partial_indices_ptr + pid, local_index)
+    tl.store(partial_values_ptr + offset_b * stride_pv_b + pid, local_max, mask = offset_b < BATCH)
+    tl.store(partial_indices_ptr + offset_b * stride_pi_b + pid, local_index, mask = offset_b < BATCH)
 
 
 @triton.jit
@@ -146,7 +182,13 @@ def lm_head_argmax(
     )
     token_id = torch.empty((rows,), dtype=torch.int64, device=hidden.device)
 
-    torch.library.wrap_triton(_lm_head_argmax_stage1_triton)[(rows, num_partials)](
+    # grid 的第一维按 BLOCK_B 分块, 所以要写成 meta 的函数.
+    # BLOCK_B 由 autotune 选: B=1 时它会挑 1(和改动前一样), B=32 时挑大的,
+    # 权重读取次数就从 B 次降到 cdiv(B, BLOCK_B) 次.
+    def grid(meta):
+        return (triton.cdiv(rows, meta["BLOCK_B"]), num_partials)
+
+    torch.library.wrap_triton(_lm_head_argmax_stage1_triton)[grid](
         hidden_ptr=rows_view,
         stride_hidden_t=rows_view.stride(0),
         weight_ptr=weight,
@@ -157,13 +199,14 @@ def lm_head_argmax(
         partial_indices_ptr=partial_indices,
         stride_pi_b=partial_indices.stride(0),
         row_stride=rows_view.stride(0),
+        BATCH=rows,
         VOCAB_SIZE=vocab_size,
         HIDDEN_SIZE=hidden_size,
         GROUP_V=GROUP_V,
         TILE_V=TILE_V,
         TILE_K=TILE_K,
-        num_warps=4,
-        num_stages=1,
+        B_BUCKET=_batch_bucket(rows),
+        # BLOCK_B / num_warps / num_stages 由 autotune 提供
     )
     torch.library.wrap_triton(_lm_head_argmax_stage2_triton)[(rows,)](
         partial_values_ptr=partial_values,

@@ -70,14 +70,20 @@ eager (op by op)              2.1s           35.6 ms/token
 
 ```
    B    ms/step   ms/token    tok/s    KV+state memory
-   1     2.014      2.014      497          32 MiB
-   4     3.641      0.910     1099         128 MiB
-  16     5.687      0.355     2813         513 MiB
-  32     8.228      0.257     3889        1025 MiB
+   1     2.010      2.010      497         32 MiB
+   4     3.423      0.856     1169        128 MiB
+  16     4.057      0.254     3944        513 MiB
+  32     4.662      0.146     6864       1025 MiB
 ```
 
-The batch grows 32x while a step grows only 4x -- the weight reads are amortized
+The batch grows 32x while a step grows only 2.3x -- the weight reads are amortized
 across 32 sequences, which is the entire point of batching.
+
+One trap here was only visible on a timeline: `lm_head_argmax` originally used
+`grid=(B, ...)`, so every sequence re-read the full 485 MiB embedding, and at B=32
+that single op took 48% of the step. Tiling the batch dimension (`BLOCK_B`) so a
+weight tile is reused across rows brought it from 3977us down to 423us, nearly
+flat in B.
 
 **Packed prefill** (B variable-length prompts concatenated into one flat sequence,
 one forward pass):
