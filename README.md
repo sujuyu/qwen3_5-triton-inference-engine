@@ -22,7 +22,8 @@ PyTorch 只用来做四件事：分配显存、变换形状（`view`/`contiguous
 一百多个 SM 大部分是闲着的，得靠 split-K 把并行度补回来；再比如同一个 `BLOCK_V`，
 在两个 kernel 里的最优值可以是相反的。
 
-目前只支持单个请求的推理，还在慢慢迭代。
+目前支持多条请求一起跑（打包 prefill + 批量 decode），但还没有服务入口——
+不能中途插入请求，也就谈不上真正的调度。还在慢慢迭代。
 
 [English README](README-EN.md)
 
@@ -46,11 +47,37 @@ Qwen3.5-0.8B 的文本主干不是常见的 24 层全注意力，而是按
 
 A100-SXM4-40GB 实测：
 
+**单条请求**：
+
 ```
                     加载+prefill+捕获    稳态生成
-CUDA Graph              2.7s           2.3 ms/token
+CUDA Graph              2.5s           2.3 ms/token
 eager（逐 op）           2.1s          35.6 ms/token
 ```
+
+**多条一起跑**（decode 阶段，同一张 CUDA Graph）：
+
+```
+   B    ms/step   ms/token    tok/s    KV+state 显存
+   1     2.014      2.014      497         32 MiB
+   4     3.641      0.910     1099        128 MiB
+  16     5.687      0.355     2813        513 MiB
+  32     8.228      0.257     3889       1025 MiB
+```
+
+batch 涨 32 倍而单步只涨 4 倍——权重读取被摊薄了 32 次，这就是凑批的收益。
+
+**打包 prefill**（B 条变长 prompt 拼成一条扁平序列，一次前向）：
+
+```
+              逐条调用    打包一次
+B=4  T=128      189ms       59ms    3.2x
+B=16 T=128      755ms      113ms    6.7x
+```
+
+省的不是 GPU 时间而是 CPU 侧的算子分发：逐条 prefill 时 B=8/T=128 和
+B=8/T=512 都是约 367ms（token 数差 4 倍而耗时相同），成本全在「调了 B 次」
+乘以那个约 43ms 的地板上。
 
 decode 一步 349 次 kernel 启动，其中 gemm 96 次占掉一半时间。图内每次启动有约
 1.9us 不可压缩的固定成本，加上 ramp-up 和 drain 合计约 4us，所以现在「让 kernel
@@ -67,6 +94,22 @@ prompt 23 tokens，最多生成 512 tokens
 
 ### 李世民的主要成就：
 1. **统一全国**：他通过一系列军事行动，成功平定了叛乱，统一了……
+```
+
+多条一起跑，直接给多个 prompt：
+
+```console
+$ python demo.py "李世民是谁?" "什么是注意力机制?" "用一句话解释 RoPE" --max-tokens 60
+batch = 3 条, prompt 长度 [15, 16, 17], 每条最多生成 60 tokens
+------------------------------------------------------------------------
+[0] 提问: 李世民是谁?
+...
+[2] 提问: 用一句话解释 RoPE
+RoPE 是一种用于生成式 AI 的注意力机制，旨在通过动态调整模型对输入序列中不同
+位置的权重，以更好地捕捉长距离依赖关系和上下文信息。
+------------------------------------------------------------------------
+[batch=3] 加载+prefill+捕获 3.2s | 共生成 157 tokens, 总用时 0.2s
+稳态 4.23 ms/step = 1.410 ms/token, 709 tok/s
 ```
 
 ## 怎么跑
@@ -133,6 +176,7 @@ python demo.py "用一句话解释什么是注意力机制"
 
 | 参数 | 说明 |
 |---|---|
+| （多个 prompt） | 给多条就走 batch：打包 prefill 一次前向 + 批量 decode |
 | `--max-tokens N` | 生成上限，同时决定给 KV cache 分配多少空间。默认 512 |
 | `--thinking` | 保留模型的 think 段，默认跳过 |
 | `--no-graph` | 关掉 CUDA Graph，走逐 op 的 eager 路径做对照 |
@@ -144,12 +188,13 @@ kernel。结果会缓存到 `~/.triton/cache`，之后启动就只剩加载 1.4 
 ## 代码结构
 
 ```
-triton_kernels/     15 个文件，21 个通过 torch.library 注册的算子
+triton_kernels/     17 个文件，26 个通过 torch.library 注册的算子
 engine/
   loader.py         safetensors 权重加载，以及两处布局重排
   cache.py          三类缓存的分配和生命周期
+  paging.py         页池（空闲链表）与页表
   runner.py         24 层前向、prefill/decode 两条路径、CUDA Graph 封装
-demo.py             命令行对话入口
+demo.py             命令行对话入口（单条 / 多条）
 tests/              数值对拍
 tools/dump_oracle.py  生成参考张量，需要独立环境
 ```
@@ -164,14 +209,20 @@ tools/dump_oracle.py  生成参考张量，需要独立环境
 ### 算子清单
 
 <details>
-<summary>21 个算子（点击展开）</summary>
+<summary>26 个算子（点击展开）</summary>
 
 **通用**
 `gemm_2d`、`qwen_rmsnorm`、`residual_add`、`swiglu`、`embedding_gather`、`lm_head_argmax`
 
-**全注意力**
-`gqa_attention_without_kvcache_casual`（prefill）、`partial_rope`、`attention_gate_pack`、
-`gqa_attention_decode`、`gqa_attention_decode_split` + `gqa_attention_decode_combine`（flash-decoding 风格的 split-K）
+**全注意力 · prefill**
+`gqa_attention_without_kvcache_casual`（定长）、
+`gqa_attention_varlen_causal`（变长打包）、`partial_rope`、`attention_gate_pack`
+
+**全注意力 · decode**
+`gqa_attention_decode`、`gqa_attention_decode_split` + `gqa_attention_decode_combine`
+（flash-decoding 风格的 split-K）、
+`paged_gqa_attention_decode_split` + `paged_gqa_attention_decode_combine` + `paged_kv_append`
+（分页 KV，支持 batch）
 
 **Gated DeltaNet**
 `depthwise_causal_conv4_prefill`、`depthwise_causal_conv4_decode`、`gdn_qk_norm_gates`、
@@ -212,10 +263,14 @@ python -m venv .venv-oracle
 
 **功能上**
 
-- **只支持单个请求。** batch 恒为 1，没有 padding，没有 continuous batching，
-  也没有请求队列。
+- **没有服务入口。** 多条请求可以一起跑（打包 prefill + 批量 decode + 分页 KV），
+  但它们必须在启动时一次给全：**不能中途插入新请求**，也没有请求队列。
+  真正的 continuous batching 还需要一层调度——池子用光时是拒绝、抢占还是换出，
+  这些决策现在一个都没有。
 - **没有连续对话。** 每次运行只处理一轮独立问答，不保留历史，也不复用上一轮的
   KV cache。要多轮的话得自己把历史拼进 prompt 重新 prefill。
+- **变长 prefill 时 GDN 走 sequential。** chunk-64 那条并行路径按 64 分块，
+  而块不能跨序列边界，还没做变长版。
 - **只有 greedy。** 没有 temperature/top-k/top-p。这不是忘了做：`lm_head_argmax`
   刻意把 LM head 的 GEMV 和 argmax 融进了一个 kernel，248320 维的 logits 从头到尾
   不物化，省掉 1 MB 的一写一读。要加采样得先改这个 kernel 的输出形式。

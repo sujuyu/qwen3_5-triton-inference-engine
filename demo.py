@@ -46,9 +46,96 @@ def render_chat(prompt: str, thinking: bool) -> str:
     return prefix + ("<think>\n" if thinking else "<think>\n\n</think>\n\n")
 
 
+def run_batch(tokenizer, questions: list[str], all_ids: list[list[int]], args) -> None:
+    """多条 prompt: 打包 prefill 一次前向 + 批量 decode.
+
+    和单条的两处结构性差异:
+
+    1. **prefill 打包成一次前向**, 而不是调 B 次. 逐条的话成本是 B x 约 43ms 的
+       CPU 分发地板 -- 实测 B=16/T=128 要 755ms, 打包之后 113ms.
+    2. **decode 天然就是 batch 的**: 每条序列贡献恰好一个 token, Q 侧规整,
+       只有 KV 侧长度不齐, 而那个不齐被吸收进每个 program 自己的循环边界里.
+       B 条互不相干, 只是恰好一起发射.
+
+    batch > 1 必须 paged: 打包之后每条序列有自己的页表行, 整块 KV 的单序列布局
+    放不下 B 条.
+
+    输出不做流式: B 条交错打印没法看. 各自收完再一起呈现.
+    """
+    batch = len(questions)
+    lengths = [len(x) for x in all_ids]
+    print(f"batch = {batch} 条, prompt 长度 {lengths}, 每条最多生成 {args.max_tokens} tokens")
+    print("-" * 72, flush=True)
+
+    load_start = time.time()
+    runner = build_runner(str(MODEL_DIR), compile=False)
+    caches = allocate_caches(
+        runner.w,
+        max(lengths) + args.max_tokens + 8,
+        paged=True,
+        batch=batch,
+    )
+    prompts = [
+        torch.tensor(x, dtype=torch.int32, device=runner.device) for x in all_ids
+    ]
+
+    # 捕获会把 cache 写脏, 所以捕获前后各 prefill 一次
+    caches.reset()
+    runner.prefill_packed(prompts, caches)
+    decoder = GraphedDecoder(runner, caches)
+    decoder.capture()
+
+    caches.reset()
+    hiddens = runner.prefill_packed(prompts, caches)
+    cur = [int(lm_head_argmax(h, runner.w.embed_tokens).item()) for h in hiddens]
+    load_elapsed = time.time() - load_start
+
+    generated: list[list[int]] = [[] for _ in range(batch)]
+    done = [False] * batch
+    start = time.time()
+    step_times: list[float] = []
+
+    for _ in range(args.max_tokens):
+        for b, tok in enumerate(cur):
+            if not done[b]:
+                if tok in DEFAULT_STOP_IDS:
+                    done[b] = True
+                else:
+                    generated[b].append(tok)
+        if all(done):
+            break
+        step_start = time.time()
+        # 已完成的序列照样参与 replay -- 图的 shape 是固定的, 不能中途缩 batch.
+        # 它们的输出直接丢弃. 这正是「grid 只与 max_batch 有关」的代价,
+        # 换来的是整个 decode step 能复用同一张图.
+        cur = decoder.step(cur)
+        step_times.append(time.time() - step_start)
+
+    elapsed = time.time() - start
+    total_tokens = sum(len(g) for g in generated)
+    ordered = sorted(step_times)
+    median = ordered[len(ordered) // 2] * 1e3 if ordered else 0.0
+
+    for b, q in enumerate(questions):
+        print(f"[{b}] 提问: {q}")
+        print(tokenizer.decode(generated[b], skip_special_tokens=False))
+        print("-" * 72, flush=True)
+
+    print(f"[batch={batch}] 加载+prefill+捕获 {load_elapsed:.1f}s | "
+          f"共生成 {total_tokens} tokens, 总用时 {elapsed:.1f}s")
+    if median:
+        print(f"稳态 {median:.2f} ms/step = {median / batch:.3f} ms/token, "
+              f"{batch / median * 1000:.0f} tok/s")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    parser.add_argument("prompt", nargs="?", default="李世民是谁? 和朱棣有什么共同点?")
+    parser.add_argument(
+        "prompt",
+        nargs="*",
+        default=["李世民是谁? 和朱棣有什么共同点?"],
+        help="给多条就走 batch: 打包 prefill 一次前向 + 批量 decode",
+    )
     parser.add_argument("--max-tokens", type=int, default=512)
     parser.add_argument("--thinking", action="store_true", help="保留 think 段")
     parser.add_argument(
@@ -57,10 +144,18 @@ def main() -> None:
     args = parser.parse_args()
 
     tokenizer = Tokenizer.from_file(str(MODEL_DIR / "tokenizer.json"))
-    rendered = render_chat(args.prompt, args.thinking)
-    prompt_ids = tokenizer.encode(rendered, add_special_tokens=False).ids
+    questions = list(args.prompt)
+    all_ids = [
+        tokenizer.encode(render_chat(q, args.thinking), add_special_tokens=False).ids
+        for q in questions
+    ]
 
-    print(f"提问: {args.prompt}")
+    if len(questions) > 1:
+        run_batch(tokenizer, questions, all_ids, args)
+        return
+
+    prompt_ids = all_ids[0]
+    print(f"提问: {questions[0]}")
     print(f"prompt {len(prompt_ids)} tokens, 最多生成 {args.max_tokens} tokens")
     print("-" * 72, flush=True)
 

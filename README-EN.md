@@ -29,8 +29,9 @@ launches only two CTAs, most of the GPU's hundred-plus SMs sit idle, and split-K
 what brings the parallelism back. That the same `BLOCK_V` can have opposite optimal
 values in two different kernels.
 
-Only single-request inference is supported at the moment; this is still being worked
-on.
+Multiple requests can now run together (packed prefill + batched decode), but there
+is still no serving entry point -- requests cannot be inserted mid-flight, so there
+is no real scheduling yet. Still being worked on.
 
 [中文 README](README.md)
 
@@ -57,11 +58,40 @@ The text backbone has 752,393,024 parameters, 1.401 GiB in BF16.
 
 Measured on an A100-SXM4-40GB:
 
+**Single request**:
+
 ```
                        load+prefill+capture    steady state
-CUDA Graph                    2.7s            2.3 ms/token
+CUDA Graph                    2.5s            2.3 ms/token
 eager (op by op)              2.1s           35.6 ms/token
 ```
+
+**Multiple requests together** (decode, one shared CUDA Graph):
+
+```
+   B    ms/step   ms/token    tok/s    KV+state memory
+   1     2.014      2.014      497          32 MiB
+   4     3.641      0.910     1099         128 MiB
+  16     5.687      0.355     2813         513 MiB
+  32     8.228      0.257     3889        1025 MiB
+```
+
+The batch grows 32x while a step grows only 4x -- the weight reads are amortized
+across 32 sequences, which is the entire point of batching.
+
+**Packed prefill** (B variable-length prompts concatenated into one flat sequence,
+one forward pass):
+
+```
+              one at a time    packed
+B=4  T=128          189ms        59ms    3.2x
+B=16 T=128          755ms       113ms    6.7x
+```
+
+What this saves is CPU-side operator dispatch, not GPU time: running prefill one
+prompt at a time costs about 367ms for both B=8/T=128 and B=8/T=512 (4x the tokens,
+same wall time) -- the cost is entirely "called it B times" multiplied by that ~43ms
+floor.
 
 A decode step launches 349 kernels, of which the 96 GEMMs take about half the time.
 Each launch carries roughly 1.9us of irreducible cost even inside a CUDA graph, and
@@ -72,6 +102,21 @@ dispatch and is largely unaffected by GPU-side work.
 ```console
 $ python demo.py "Explain attention in one sentence"
 ```
+
+Pass several prompts to run them as a batch:
+
+```console
+$ python demo.py "Who was Li Shimin?" "What is attention?" "Explain RoPE" --max-tokens 60
+batch = 3 条, prompt 长度 [15, 16, 17], 每条最多生成 60 tokens
+------------------------------------------------------------------------
+[0] ...
+[2] ...
+------------------------------------------------------------------------
+[batch=3] ... | 共生成 157 tokens, 总用时 0.2s
+稳态 4.23 ms/step = 1.410 ms/token, 709 tok/s
+```
+
+(The demo's own output is in Chinese.)
 
 ## Getting started
 
@@ -136,6 +181,7 @@ python demo.py "Explain what an attention mechanism is, in one sentence"
 
 | Flag | Meaning |
 |---|---|
+| (multiple prompts) | Pass several to run them as a batch: packed prefill + batched decode |
 | `--max-tokens N` | Generation cap; also determines how much KV cache is allocated. Default 512 |
 | `--thinking` | Keep the model's think section (skipped by default) |
 | `--no-graph` | Disable CUDA Graph and run the eager op-by-op path for comparison |
@@ -148,12 +194,13 @@ enabled automatically by `triton_kernels/__init__.py`.
 ## Layout
 
 ```
-triton_kernels/     15 files, 21 ops registered through torch.library
+triton_kernels/     17 files, 26 ops registered through torch.library
 engine/
   loader.py         safetensors loading + layout rearrangement (see below)
   cache.py          allocation and lifetime of the three cache types
+  paging.py         page pool (free list) and block tables
   runner.py         24-layer forward, prefill/decode paths, CUDA Graph wrapper
-demo.py             command-line entry point
+demo.py             command-line entry point (single or batched)
 tests/              numerical parity tests
 tools/dump_oracle.py  generates reference tensors (needs a separate venv)
 ```
@@ -170,15 +217,21 @@ kernels get contiguous memory:
 ### Kernel inventory
 
 <details>
-<summary>21 ops (click to expand)</summary>
+<summary>26 ops (click to expand)</summary>
 
 **General**
 `gemm_2d`, `qwen_rmsnorm`, `residual_add`, `swiglu`, `embedding_gather`, `lm_head_argmax`
 
-**Full attention**
-`gqa_attention_without_kvcache_casual` (prefill), `partial_rope`, `attention_gate_pack`,
+**Full attention, prefill**
+`gqa_attention_without_kvcache_casual` (fixed length),
+`gqa_attention_varlen_causal` (packed variable length), `partial_rope`,
+`attention_gate_pack`
+
+**Full attention, decode**
 `gqa_attention_decode`, `gqa_attention_decode_split` + `gqa_attention_decode_combine`
-(flash-decoding style split-K)
+(flash-decoding style split-K),
+`paged_gqa_attention_decode_split` + `paged_gqa_attention_decode_combine` +
+`paged_kv_append` (paged KV, batched)
 
 **Gated DeltaNet**
 `depthwise_causal_conv4_prefill`, `depthwise_causal_conv4_decode`, `gdn_qk_norm_gates`,
@@ -221,11 +274,17 @@ This is a learning project, **not a production inference server**. Known boundar
 
 **Functional**
 
-- **Single request only.** Batch size is always 1. No padding, no continuous
-  batching, no request queue.
+- **No serving entry point.** Multiple requests can run together (packed prefill +
+  batched decode + paged KV), but they must all be supplied at startup: **new
+  requests cannot be inserted mid-flight**, and there is no request queue. Real
+  continuous batching needs a scheduling layer on top -- what to do when the page
+  pool runs out (reject, preempt, or swap) is not implemented at all.
 - **No multi-turn conversation.** Each run handles one independent prompt; history is
   not kept and the KV cache is not reused across turns. Multi-turn would mean
   concatenating the history into the prompt and re-running prefill yourself.
+- **Variable-length prefill falls back to the sequential GDN path.** The chunk-64
+  parallel path tiles by 64 and a tile must not straddle a sequence boundary; a
+  varlen version of it has not been written.
 - **Greedy sampling only.** No temperature/top-k/top-p. This is deliberate rather than
   missing: `lm_head_argmax` deliberately fuses the LM head GEMV and the argmax into
   one kernel, so the 248320-dimensional logit vector is never materialized — saving a
