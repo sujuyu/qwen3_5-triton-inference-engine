@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 import torch
@@ -51,6 +52,7 @@ from triton_kernels.gqa_attention_decode_paged import (
 )
 from engine.cache import DecodeCaches, allocate_caches
 from triton_kernels.gemm_2d import gemm_2d
+from triton_kernels.gqa_attention_varlen_causal import gqa_attention_varlen_causal
 from triton_kernels.gqa_attention_without_kvcache_casual import (
     gqa_attention_without_kvcache_casual,
 )
@@ -64,6 +66,74 @@ from triton_kernels.vocab_argmax import lm_head_argmax
 # tokenizer_config 把 <|im_end|> 设为 EOS, text config 里还有 <|endoftext|>.
 # 停止 token 由调用层决定, 这里只给默认值.
 DEFAULT_STOP_IDS = (248046, 248044)
+
+@dataclass(frozen=True)
+class PackedBatch:
+    """把 B 条变长 prompt 打包成一条扁平序列所需的全部索引.
+
+    ```text
+    prompt        [A A A]  [B B B B B B]  [C C]
+    packed         A A A    B B B B B B    C C          total = 11
+    cu_seqlens    [0, 3, 9, 11]
+    seq_start     [0,0,0, 3,3,3,3,3,3, 9,9]
+    position_ids  [0,1,2, 0,1,2,3,4,5, 0,1]             <- 每条从 0 重新开始
+    ```
+
+    打包而不是 padding, 是因为 `_forward` 处理的本来就是扁平的 `[T, 1024]`:
+    所有逐 token 的算子拿 `[total_tokens, ...]` 一行不用改, **只有三个有跨 token
+    交互的需要知道边界**——attention、conv4_prefill、GDN 递推. 而且三者需要的
+    索引还不一样, 取决于它们往回够多远:
+
+        conv4_prefill   固定回看 3 个 token   只要 seq_start(一个下界钳位)
+        attention       整条序列             要 cu_seqlens(基址 + 循环边界)
+        GDN 递推        整条序列(状态)        要 cu_seqlens(grid 加 batch 维)
+
+    动机是摊薄分发开销而不是 GPU 效率: 逐条 prefill 时 B=8/T=128 要 366ms、
+    B=8/T=512 也是 367ms(token 数差 4 倍而耗时相同), 成本全在「调了 B 次」乘以
+    那个约 43ms 的 CPU 地板上.
+    """
+
+    cu_seqlens: torch.Tensor    # [B+1] INT32
+    seq_start: torch.Tensor     # [total_tokens] INT32
+    position_ids: torch.Tensor  # [1, total_tokens] INT32
+    max_seqlen: int
+    lengths: tuple[int, ...]
+
+    @property
+    def batch(self) -> int:
+        return len(self.lengths)
+
+    @property
+    def total_tokens(self) -> int:
+        return int(self.cu_seqlens[-1])
+
+    def slice_of(self, seq: int) -> slice:
+        """第 seq 条序列在打包缓冲里的区间."""
+        return slice(int(self.cu_seqlens[seq]), int(self.cu_seqlens[seq + 1]))
+
+
+def build_packed_batch(
+    lengths: list[int], *, device: torch.device | str = "cuda"
+) -> PackedBatch:
+    starts, acc = [], 0
+    for n in lengths:
+        starts.append(acc)
+        acc += n
+    cu = torch.tensor(starts + [acc], dtype=torch.int32, device=device)
+    lens_t = torch.tensor(lengths, device=device)
+    seq_start = torch.repeat_interleave(cu[:-1], lens_t)
+    # 每条序列的位置从 0 重新开始: 全局下标减去本序列起点
+    position_ids = (
+        torch.arange(acc, dtype=torch.int32, device=device) - seq_start
+    ).unsqueeze(0)
+    return PackedBatch(
+        cu_seqlens=cu,
+        seq_start=seq_start.to(torch.int32),
+        position_ids=position_ids,
+        max_seqlen=max(lengths),
+        lengths=tuple(lengths),
+    )
+
 
 # GDN prefill 走 chunk-64 并行路径的最小 token 数, 低于它用 sequential 递推.
 # 依据见 `_gdn` 里的实测表. 注意这个阈值**不能**照搬 kernel 级的交叉点.
@@ -131,6 +201,7 @@ class Qwen35Runner:
         trace: dict | None,
         tag: str,
         fill: tuple[torch.Tensor, torch.Tensor] | None = None,
+        packed: "PackedBatch | None" = None,
     ):
         token_num = h.shape[0]
         heads = self.w.linear_num_heads
@@ -142,7 +213,10 @@ class Qwen35Runner:
         a = gemm_2d(h, w.in_proj_a)  # [T,16]
         b = gemm_2d(h, w.in_proj_b)  # [T,16]
 
-        conv = depthwise_causal_conv4_prefill(qkv, w.conv1d)  # [T,6144], 含 SiLU
+        # 打包时传 seq_start: conv 回看 3 个 token, 不加钳位会读到上一条序列的尾巴
+        conv = depthwise_causal_conv4_prefill(
+            qkv, w.conv1d, None if packed is None else packed.seq_start
+        )  # [T,6144], 含 SiLU
 
         # 连续三段切 q|k|v, 各自 view 成 [T,H,D]. 切片是 strided view,
         # 但最后一维连续, view 合法; 下游 kernel 都 stride-aware.
@@ -173,7 +247,16 @@ class Qwen35Runner:
         #
         # 所以阈值按模型级的 2048 取, 不是 kernel 级的 192. 等 prefill 本身不再
         # 卡在 CPU 上(进 CUDA Graph 或让它走 compile 路径), 这个阈值应该下调.
-        if token_num >= GDN_CHUNKED_PREFILL_MIN_TOKENS:
+        # **打包时必须走 sequential.** chunked 按 64 分块而块不能跨序列边界,
+        # 它还不支持 cu_seqlens; 而且这里的 token_num 是打包后的**总长**, 32 条
+        # 64 token 的序列加起来就 2048, 会错误地路由到 chunked.
+        # sequential 那边 grid 已经加了 batch 维, B 条序列本来就是并行的,
+        # 所以并行度不吃亏. chunked 的变长版留作后续.
+        if packed is not None:
+            core, state = gdn_recurrent_prefill_sequential(
+                q_n, k_n, v, beta, g, packed.cu_seqlens
+            )  # state: [B,H,DK,DV]
+        elif token_num >= GDN_CHUNKED_PREFILL_MIN_TOKENS:
             core, state = call_gdn_recurrent_prefill_chunked_triton(q_n, k_n, v, beta, g)
         else:
             core, state = gdn_recurrent_prefill_sequential(q_n, k_n, v, beta, g)
@@ -185,8 +268,16 @@ class Qwen35Runner:
             conv_state, recurrent_state = fill
             # conv state 取的是 conv 的**输入** qkv 的最后 4 行, 不是 conv 输出.
             # T < 4 时 conv_state_from_prefill 会在上方补零.
-            conv_state.copy_(conv_state_from_prefill(qkv))
-            recurrent_state.copy_(state)
+            if packed is None:
+                conv_state.copy_(conv_state_from_prefill(qkv))
+                recurrent_state.copy_(state)
+            else:
+                # 递推状态 kernel 已经按序列分好了, 直接整块拷.
+                # conv state 要逐条取各自最后 4 行 -- 它们在打包缓冲里位置不同,
+                # 没法一次切出来. B 不大且 prefill 只跑一次, 循环可以接受.
+                recurrent_state.copy_(state)
+                for b in range(packed.batch):
+                    conv_state[b].copy_(conv_state_from_prefill(qkv[packed.slice_of(b)]))
 
         if trace is not None:
             trace[f"{tag}.in_proj_qkv"] = qkv
@@ -216,6 +307,7 @@ class Qwen35Runner:
         tag: str,
         fill: tuple[torch.Tensor, torch.Tensor] | None = None,
         block_table: torch.Tensor | None = None,
+        packed: "PackedBatch | None" = None,
     ):
         token_num = h.shape[0]
         nh = self.w.num_attention_heads
@@ -240,12 +332,25 @@ class Qwen35Runner:
         )
         v4 = v.view(token_num, nkv, d).unsqueeze(0).permute(0, 2, 1, 3)
 
-        ctx = gqa_attention_without_kvcache_casual(q4, k4, v4)  # [1,H,T,D]
+        if packed is None:
+            ctx = gqa_attention_without_kvcache_casual(q4, k4, v4)  # [1,H,T,D]
+        else:
+            # 变长版吃 [total, H, D]; q4/k4/v4 是 [1,H,T,D], permute 回去即可
+            # (都是 view, 不产生拷贝). 块对角是自动的: 每个 program 的循环边界
+            # 就在自己那一段里, 跨序列的 KV 根本不会被访问到.
+            ctx = gqa_attention_varlen_causal(
+                q4[0].permute(1, 0, 2).contiguous(),
+                k4[0].permute(1, 0, 2).contiguous(),
+                v4[0].permute(1, 0, 2).contiguous(),
+                packed.cu_seqlens,
+                packed.max_seqlen,
+            ).permute(1, 0, 2).unsqueeze(0)  # [total,H,D] -> [1,H,T,D]
 
         # gate 内存布局是 [T,H,D]; permute 成 [1,H,T,D] 的 view 再传.
         gate4 = gate.view(1, token_num, nh, d).permute(0, 2, 1, 3)
-        packed = attention_gate_pack(ctx, gate4)  # [T,2048] 连续
-        out = gemm_2d(packed, w.o_proj)  # [T,1024]
+        # 名字避开参数 packed(PackedBatch), 那个是变长打包的索引
+        gated = attention_gate_pack(ctx, gate4)  # [T,2048] 连续
+        out = gemm_2d(gated, w.o_proj)  # [T,1024]
 
         if fill is not None:
             k_cache, v_cache = fill
@@ -254,9 +359,17 @@ class Qwen35Runner:
                 # 整块: 逻辑位置 == 物理位置, 一次连续拷贝
                 k_cache[:, :token_num, :].copy_(k4[0])
                 v_cache[:, :token_num, :].copy_(v4[0])
-            else:
+            elif packed is None:
                 # paged: 逻辑上相邻的 token 可能落在物理上不相邻的页, 必须 scatter
                 paged_kv_fill(k_cache, v_cache, k4[0], v4[0], block_table)
+            else:
+                # 打包: 每条序列有自己那一行页表, 逐条 scatter
+                for b in range(packed.batch):
+                    seg = packed.slice_of(b)
+                    paged_kv_fill(
+                        k_cache, v_cache,
+                        k4[0][:, seg, :], v4[0][:, seg, :], block_table[b],
+                    )
 
         if trace is not None:
             trace[f"{tag}.q_proj_q"] = q_raw
@@ -268,7 +381,7 @@ class Qwen35Runner:
             trace[f"{tag}.rope_q"] = q4
             trace[f"{tag}.rope_k"] = k4
             trace[f"{tag}.ctx"] = ctx
-            trace[f"{tag}.packed"] = packed
+            trace[f"{tag}.packed"] = gated  # 注意不是参数 packed(PackedBatch)
             trace[f"{tag}.out_proj"] = out
         return out
 
@@ -482,6 +595,7 @@ class Qwen35Runner:
         trace_layers: set[int] | None,
         caches: DecodeCaches | None = None,
         seq: int = 0,
+        packed: "PackedBatch | None" = None,
     ) -> torch.Tensor:
         if trace_layers is None:
             trace_layers = {0, 3}
@@ -500,21 +614,26 @@ class Qwen35Runner:
                 inner[f"{tag}.input_layernorm"] = h
 
             if isinstance(layer, GDNLayerWeights):
-                h = self._gdn(
-                    h, layer, inner, tag,
-                    # 取第 seq 条序列那一片: conv_states[i] 是 [B,4,D],
-                    # [seq] 之后正好是 prefill 版 _gdn 期望的 [4,D]
-                    fill=None if caches is None
-                    else (caches.conv_states[i][seq], caches.recurrent_states[i][seq]),
-                )
+                # 打包时一次写满所有槽, 传整块 [B,4,D] / [B,H,DK,DV];
+                # 单序列时取第 seq 片, [4,D] / [H,DK,DV]
+                if caches is None:
+                    gdn_fill = None
+                elif packed is None:
+                    gdn_fill = (caches.conv_states[i][seq], caches.recurrent_states[i][seq])
+                else:
+                    gdn_fill = (caches.conv_states[i], caches.recurrent_states[i])
+                h = self._gdn(h, layer, inner, tag, fill=gdn_fill, packed=packed)
             else:
                 h = self._attention(
                     h, layer, pos, inner, tag,
-                    # KV 页池是所有序列共用的, 不切; 区分靠 block_table 的第 seq 行
+                    # KV 页池是所有序列共用的, 不切; 区分靠 block_table 的行.
+                    # 打包时传整张表(kernel 里逐条取行), 单序列时传第 seq 行.
                     fill=None if caches is None
                     else (caches.k_caches[i], caches.v_caches[i]),
                     block_table=None if caches is None or not caches.paged
-                    else caches.block_table[seq],
+                    else (caches.block_table if packed is not None
+                          else caches.block_table[seq]),
+                    packed=packed,
                 )
             x = residual_add(h, residual)
 
@@ -596,6 +715,41 @@ class Qwen35Runner:
         # 只动这一槽 -- 其他序列各有各的进度.
         caches.pos[seq] = token_num
         return hidden
+
+    def prefill_packed(
+        self,
+        prompts: list[torch.Tensor],
+        caches: DecodeCaches,
+    ) -> list[torch.Tensor]:
+        """一次前向 prefill 掉 B 条变长 prompt, 返回每条各自的 final hidden.
+
+        对比逐条调用 `prefill()`: 那样要跑 B 次 24 层前向, 而这里只跑一次.
+        成本主要不在 GPU 而在 CPU 侧的算子分发(约 43ms 的地板), 所以省的是
+        `(B-1) x 43ms` 的首 token 延迟.
+
+        **必须 paged**: 打包之后每条序列有自己的页表行, 整块 KV 的单序列布局
+        放不下 B 条.
+        """
+        assert caches.paged, "打包 prefill 需要 paged=True 的 caches"
+        assert len(prompts) == caches.batch, (
+            f"prompt 条数 {len(prompts)} 与 caches.batch {caches.batch} 不符"
+        )
+        lengths = [int(p.shape[0]) for p in prompts]
+        for b, n in enumerate(lengths):
+            assert n <= caches.max_len, f"第 {b} 条 prompt 长度 {n} 超出 {caches.max_len}"
+
+        caches.reserve(caches.max_len)
+        packed = build_packed_batch(lengths, device=self.device)
+        flat = torch.cat([p.to(torch.int32) for p in prompts])
+
+        hidden = self._forward(
+            flat, packed.position_ids, None, None, caches=caches, packed=packed
+        )
+        # 每条序列各自推进到自己的长度
+        caches.pos.copy_(
+            torch.tensor(lengths, dtype=torch.int64, device=self.device)
+        )
+        return [hidden[packed.slice_of(b)] for b in range(len(prompts))]
 
     def generate_cached(
         self,

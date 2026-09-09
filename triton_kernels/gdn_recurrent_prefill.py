@@ -68,12 +68,13 @@ def _gdn_recurrent_prefill_sequential_kernel(
     out_ptr,
     stride_o_t: tl.constexpr, stride_o_h: tl.constexpr, stride_o_d: tl.constexpr,
 
-    state_ptr,
+    state_ptr,   # [B, H, DK, DV] FP32, 每条序列一份最终状态
+    stride_state_b: tl.constexpr,
     stride_state_h: tl.constexpr,
     stride_state_dk: tl.constexpr,
     stride_state_dv: tl.constexpr,
 
-    T,
+    cu_seqlens_ptr,  # [B+1] INT32, 打包缓冲里每条序列的起点; 单序列时是 [0, T]
     H: tl.constexpr, DK: tl.constexpr, DV: tl.constexpr,
     T_BUCKET: tl.constexpr,
     BLOCK_V: tl.constexpr,
@@ -81,14 +82,29 @@ def _gdn_recurrent_prefill_sequential_kernel(
     # 朴素版本的实现 由于s_t 需要依赖s_{t-1} 因此在token维度上使用一个block进行顺序遍历
     # 理论上在head维度和dv维度上切分block 实际每个head独立起一个block
     # 这个版本不考虑 kv cache
-
-    pid_h, pid_v = tl.program_id(0), tl.program_id(1)
+    #
+    # 变长打包(packing)：grid 加一维 batch, **一条序列一个 program**.
+    #
+    # 这一点和 conv 不同. conv 只往回看 3 个 token, 加个下界钳位就行, grid 不用动;
+    # 这里的递推状态 s 作用域是**整条序列**, 必须在每条序列开头归零. 如果沿用扁平的
+    # 单循环再在边界处清零, B 条序列就会被**串行**跑完 -- 而它们本来是互不相干的.
+    # 拆到 grid 的 batch 维上, 它们才是并行的, 而且 CTA 数从 H*(DV/BLOCK_V) 涨到
+    # B 倍, 对这个本来就受限于「T 方向串行」的 kernel 是额外的好处.
+    #
+    # 单序列时 cu_seqlens = [0, T], B=1, 行为与改动前完全一致.
+    pid_b = tl.program_id(0)
+    pid_h, pid_v = tl.program_id(1), tl.program_id(2)
     offset_dv = pid_v * BLOCK_V + tl.arange(0, BLOCK_V)
     offset_dk = tl.arange(0, DK)
 
+    seq_start = tl.load(cu_seqlens_ptr + pid_b).to(tl.int32)
+    seq_len = tl.load(cu_seqlens_ptr + pid_b + 1).to(tl.int32) - seq_start
+
+    # 状态从零开始 -- 这就是「每条序列开头重置」, 因为一个 program 只管一条序列
     s = tl.zeros([DK, BLOCK_V], dtype = tl.float32)
 
-    for t in tl.range(0, T):
+    for local_t in tl.range(0, seq_len):
+        t = seq_start + local_t
         g = tl.load(g_ptr + t * stride_g_t + pid_h * stride_g_h).to(tl.float32)
         # g < 0 计算exp没有溢出风险
         s = tl.exp(g) * s
@@ -118,7 +134,11 @@ def _gdn_recurrent_prefill_sequential_kernel(
             out
         )
     tl.store(
-        state_ptr + pid_h * stride_state_h + offset_dk[:, None] * stride_state_dk + offset_dv[None, :] * stride_state_dv,
+        state_ptr
+        + pid_b * stride_state_b
+        + pid_h * stride_state_h
+        + offset_dk[:, None] * stride_state_dk
+        + offset_dv[None, :] * stride_state_dv,
         s
     )
 
@@ -1037,7 +1057,15 @@ def gdn_recurrent_prefill_sequential(
     v: torch.Tensor,
     beta: torch.Tensor,
     g: torch.Tensor,
+    cu_seqlens: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """GDN 的 delta rule 递推, prefill 版.
+
+    `cu_seqlens` 传 `[B+1]` INT32 时进入变长打包模式: 输入是 `[total_tokens, H, D]`
+    的打包缓冲, 每条序列各自从零状态开始递推, 返回的 state 形状为
+    `[B, H, DK, DV]`. 传 None 时是单序列行为, state 是 `[H, DK, DV]`,
+    与改动前完全一致(内部按 cu_seqlens=[0, T] 处理).
+    """
     assert q.ndim == 3 and k.ndim == 3 and v.ndim == 3
     assert q.shape == k.shape
     assert q.shape[:2] == v.shape[:2]
@@ -1056,15 +1084,29 @@ def gdn_recurrent_prefill_sequential(
     # All autotune candidates divide value_dim, so no DV mask is needed.
     assert value_dim % 128 == 0
 
+    if cu_seqlens is None:
+        # 单序列退化: 一条从 0 到 T 的序列, 数值上与改动前完全一致
+        cu_seqlens = torch.tensor([0, token_num], dtype=torch.int32, device=q.device)
+        squeeze_state = True
+    else:
+        assert cu_seqlens.dtype == torch.int32 and cu_seqlens.ndim == 1
+        assert int(cu_seqlens[-1]) == token_num, (
+            f"cu_seqlens[-1]={int(cu_seqlens[-1])} 与打包缓冲的 token 数 {token_num} 不符"
+        )
+        squeeze_state = False
+    batch = cu_seqlens.numel() - 1
+
     out = torch.empty_like(v)
     state = torch.empty(
-        (num_heads, key_dim, value_dim),
+        (batch, num_heads, key_dim, value_dim),
         dtype=torch.float32,
         device=q.device,
     )
 
     def grid(meta):
-        return (num_heads, value_dim // meta["BLOCK_V"])
+        # batch 放 dim0: 每条序列一个 program, 它们本来就互不相干.
+        # 沿用扁平单循环再在边界清零的话, B 条会被串行跑完.
+        return (batch, num_heads, value_dim // meta["BLOCK_V"])
 
     torch.library.wrap_triton(_gdn_recurrent_prefill_sequential_kernel)[grid](
         q_ptr=q,
@@ -1090,16 +1132,17 @@ def gdn_recurrent_prefill_sequential(
         stride_o_h=out.stride(1),
         stride_o_d=out.stride(2),
         state_ptr=state,
-        stride_state_h=state.stride(0),
-        stride_state_dk=state.stride(1),
-        stride_state_dv=state.stride(2),
-        T=token_num,
+        stride_state_b=state.stride(0),
+        stride_state_h=state.stride(1),
+        stride_state_dk=state.stride(2),
+        stride_state_dv=state.stride(3),
+        cu_seqlens_ptr=cu_seqlens,
         H=num_heads,
         DK=key_dim,
         DV=value_dim,
         T_BUCKET=_token_bucket(token_num),
     )
-    return out, state
+    return out, (state[0] if squeeze_state else state)
 
 
 @torch.library.register_fake("wy_lib::gdn_recurrent_prefill_sequential")
@@ -1109,13 +1152,19 @@ def _gdn_recurrent_prefill_sequential_fake(
     v: torch.Tensor,
     beta: torch.Tensor,
     g: torch.Tensor,
+    cu_seqlens: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     num_heads = q.shape[1]
     key_dim = q.shape[2]
     value_dim = v.shape[2]
     out = torch.empty_like(v)
+    shape = (
+        (num_heads, key_dim, value_dim)
+        if cu_seqlens is None
+        else (cu_seqlens.numel() - 1, num_heads, key_dim, value_dim)
+    )
     state = torch.empty(
-        (num_heads, key_dim, value_dim),
+        shape,
         dtype=torch.float32,
         device=q.device,
     )
@@ -1128,8 +1177,9 @@ def call_gdn_recurrent_prefill_sequential_triton(
     v: torch.Tensor,
     beta: torch.Tensor,
     g: torch.Tensor,
+    cu_seqlens: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    return gdn_recurrent_prefill_sequential(q, k, v, beta, g)
+    return gdn_recurrent_prefill_sequential(q, k, v, beta, g, cu_seqlens)
 
 
 @torch.library.triton_op(
@@ -1230,6 +1280,22 @@ def call_gdn_recurrent_decode_triton(
     state: torch.Tensor,
 ) -> torch.Tensor:
     return gdn_recurrent_decode(q, k, v, beta, g, state)
+
+
+def _make_normalized_inputs(token_num: int, num_heads: int, key_dim: int, value_dim: int):
+    """按模型真实分布造输入: k 必须 L2 归一化.
+
+    用裸 randn 的话 ||k||~sqrt(DK), WY 变换要解的三角系统会发散成 Inf/NaN
+    (chunked 路径). sequential 路径虽然不解三角系统, 但保持同一分布便于对拍.
+    """
+    q = torch.randn(token_num, num_heads, key_dim, device="cuda")
+    k = torch.randn(token_num, num_heads, key_dim, device="cuda")
+    q = (q * torch.rsqrt((q * q).sum(-1, keepdim=True) + 1e-6) * key_dim**-0.5).bfloat16()
+    k = (k * torch.rsqrt((k * k).sum(-1, keepdim=True) + 1e-6)).bfloat16()
+    v = torch.randn(token_num, num_heads, value_dim, dtype=torch.bfloat16, device="cuda")
+    beta = torch.sigmoid(torch.randn(token_num, num_heads, device="cuda"))
+    g = -torch.nn.functional.softplus(torch.randn(token_num, num_heads, device="cuda"))
+    return q, k, v, beta, g
 
 
 def _torch_chunk_prepare_wy_reference(
@@ -1606,3 +1672,55 @@ if __name__ == "__main__":
         f"best_decode_config={_gdn_recurrent_decode_kernel.best_config}"
     )
     print("GDN recurrent prefill + decode equivalence test passed.")
+
+    # ---- 变长打包 --------------------------------------------------------
+    # 判据: 打包跑一次, 逐条切出来必须与「逐条单独跑」一致.
+    #
+    # 用相对误差而不是逐字节相等: autotune 的 key 含 T_BUCKET, 打包时看到的是
+    # **总长**、逐条跑时看到的是各自的长度, 落进不同的桶就会选到不同的 BLOCK_V,
+    # 而 tl.sum(axis=0) 的归约树依赖 tile 在线程间的布局 -- BLOCK_V 一变,
+    # 浮点舍入顺序就变. 实测 config 相同的用例全部逐位相同(0.00e+00),
+    # 不同的差 1e-4 量级, 是纯舍入而不是逻辑错误.
+    print("\n=== 变长打包 ===")
+    for lengths in ([5], [3, 6, 2], [1, 1, 1, 1], [17, 3], [64, 1, 100]):
+        total = sum(lengths)
+        q, k, v, beta, g = _make_normalized_inputs(total, 16, 128, 128)
+        cu = torch.tensor(
+            [0] + torch.tensor(lengths).cumsum(0).tolist(),
+            dtype=torch.int32,
+            device="cuda",
+        )
+        out_packed, state_packed = call_gdn_recurrent_prefill_sequential_triton(
+            q, k, v, beta, g, cu
+        )
+
+        outs, states, offset = [], [], 0
+        for n in lengths:
+            o, st = call_gdn_recurrent_prefill_sequential_triton(
+                q[offset : offset + n], k[offset : offset + n],
+                v[offset : offset + n], beta[offset : offset + n],
+                g[offset : offset + n],
+            )
+            outs.append(o); states.append(st); offset += n
+        out_ref = torch.cat(outs, dim=0)
+        state_ref = torch.stack(states)
+
+        torch.testing.assert_close(out_packed, out_ref, rtol=2e-2, atol=2e-2)
+        torch.testing.assert_close(state_packed, state_ref, rtol=2e-4, atol=2e-4)
+        out_err = (out_packed.float() - out_ref.float()).abs().max().item()
+        st_err = (state_packed - state_ref).abs().max().item()
+        print(
+            f"  lengths={str(lengths):<18} total={total:<5} "
+            f"max_abs_out={out_err:.8f} max_abs_state={st_err:.8f}"
+        )
+
+    # 单序列下传 None 与传 [0, T] 必须完全等价(状态多一个 batch 维)
+    q, k, v, beta, g = _make_normalized_inputs(19, 16, 128, 128)
+    o1, s1 = call_gdn_recurrent_prefill_sequential_triton(q, k, v, beta, g)
+    o2, s2 = call_gdn_recurrent_prefill_sequential_triton(
+        q, k, v, beta, g, torch.tensor([0, 19], dtype=torch.int32, device="cuda")
+    )
+    assert torch.equal(o1, o2) and torch.equal(s1, s2[0]), "单序列退化路径不一致"
+    print(f"  单序列: 传 None 与传 [0,19] 逐字节相同, state {tuple(s1.shape)} / {tuple(s2.shape)}")
+
+    print("\nAll varlen GDN recurrent prefill tests passed.")

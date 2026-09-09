@@ -18,7 +18,7 @@ cu_seqlens  [0, 3, 9, 11]
 **打包对这个项目改动更小**, 因为 `_forward` 处理的本来就是扁平的 `[T, 1024]`.
 所有逐 token 的算子(gemm_2d / rmsnorm / swiglu / residual_add / SwiGLU /
 gdn_qk_norm_gates / gdn_gated_rmsnorm / attention_gate_pack)拿 `[total, ...]`
-一行都不用改; `partial_rope` 只要 position_ids 每条序列从 0 重新开始, 也不用改.
+一行都不用改;`partial_rope` 只要 position_ids 每条序列从 0 重新开始, 也不用改.
 **只有三个算子有跨 token 交互**: 本文件(attention), conv4_prefill(回看 3 个
 token, 跨边界要补零), GDN 递推(状态要在每条序列开头重置).
 
@@ -114,43 +114,101 @@ def _gqa_attention_varlen_causal_triton(
     BLOCK_Q_S: tl.constexpr,
     TILE_KV_S: tl.constexpr,
 ):
-    q_id = tl.program_id(0)      # 第几个 q 块(按 max_seqlen 起, 可能超出本序列)
+    # **逆序发射**: q 块 m 要扫 0..m 个 KV 块, 工作量正比于 m+1, 所以块号越大越重.
+    # CTA 大致按 program_id 递增顺序发射, 正序的话轻的先上、重的最后才开始,
+    # 尾巴很长; 反过来让重的先占住 SM, 轻的陆续填进空出来的槽位 -- 经典的
+    # LPT(最长处理时间优先)调度. 合成实验实测: N=64 时 +4.8%, N=512 时 +4.0%,
+    # N=2048 时 +18.6%(N 是 q 块数).
+    #
+    # 变长下这么写还有个副作用是好的: 短序列的高位 q 块被排到了发射序列的**开头**,
+    # 它们会立刻早退, 把 SM 让给真正有活的块.
+    q_id = tl.num_programs(0) - 1 - tl.program_id(0)
     head_id = tl.program_id(1)   # 按 KV head 起 block, 一个 program 管 group_size 个 Q head
     batch_id = tl.program_id(2)  # 第几条序列
 
-    # TODO(用户填) -- 与定长版本的全部差异都在这里, 四处:
-    #
-    # 1. 取本序列的起点和长度(替代原来的 batch_id * stride_*_b):
-    #
-    #        seq_start = tl.load(cu_seqlens_ptr + batch_id)
-    #        seq_len   = tl.load(cu_seqlens_ptr + batch_id + 1) - seq_start
-    #
-    # 2. 早退. grid 按最长序列起, 短序列的高位 q 块没有活:
-    #
-    #        if q_id * BLOCK_Q_S >= seq_len:
-    #            return
-    #
-    #    注意**要在做任何昂贵的事情之前 return**. 实测空转 CTA 约 0.7ns 一个,
-    #    前提是它没先载入一堆数据; 先 load 再发现没活就不便宜了.
-    #
-    # 3. 基址. 原来是 `q_ptr + batch_id * stride_q_b + head_id * group_size * stride_q_h`,
-    #    现在 batch 维不存在了, 换成在打包缓冲里的行偏移:
-    #
-    #        q_base_ptr = q_ptr + seq_start * stride_q_s + head_id * group_size * stride_q_h
-    #        o_base_ptr = o_ptr + seq_start * stride_o_s + head_id * group_size * stride_o_h
-    #        k_base_ptr = k_ptr + seq_start * stride_k_s + head_id * stride_k_h
-    #        v_base_ptr = v_ptr + seq_start * stride_v_s + head_id * stride_v_h
-    #
-    # 4. 所有用到 `q_seq_len` / `kv_seq_len` 的地方换成 `seq_len`: q 的载入 mask,
-    #    两个 make_block_ptr 的 shape, KV 循环的上界, 最后 store 的 mask.
-    #    KV 循环上界仍是 `q_id * BLOCK_Q_S + BLOCK_Q_S`(causal),
-    #    block_ptr 的 boundary_check 会把超出 seq_len 的部分挡住.
-    #
-    # 其余部分 -- 在线 softmax, causal mask, GQA 的 head 广播 -- **逐行照抄定长版本**.
-    # causal mask 尤其不用改: offset_q_s 和 offset_kv_s 都是序列**局部**坐标,
-    # `offset_kv_s <= offset_q_s` 在局部坐标里就是正确的因果关系,
-    # 而跨序列的 KV 因为循环边界在自己那一段里, 根本不会被访问到.
-    pass  # <- 在这里实现
+    seq_start = tl.load(cu_seqlens_ptr + batch_id).to(tl.int32)
+    seq_len = tl.load(cu_seqlens_ptr + batch_id + 1).to(tl.int32) - seq_start
+
+    if q_id * BLOCK_Q_S >= seq_len:
+        return
+    
+    q_ptr = q_ptr + seq_start * stride_q_s + head_id * group_size * stride_q_h
+    k_ptr = k_ptr + seq_start * stride_k_s + head_id * stride_k_h
+    v_ptr = v_ptr + seq_start * stride_v_s + head_id * stride_v_h
+    o_ptr = o_ptr + seq_start * stride_o_s + head_id * group_size * stride_o_h
+
+    # exp2 而不是 exp: 硬件有 ex2.approx 指令, 比 exp 快.
+    # 换底靠把 log2(e) 折进 scale 里 -- exp(x) == exp2(x * log2(e)).
+    # 再把整个 qk_scale 预乘到 q 上, 循环内就省掉了每次迭代对 qk tile 的一次乘法
+    # (q 是 [G, BLOCK_Q_S, D] 只乘一次, qk 是 [G, BLOCK_Q_S, TILE_KV_S] 每轮一次).
+    # 代价是预乘之后要转回 BF16 给 tensor core, 会损失约 8 位尾数;
+    # 定长版本就是这么做的, 实测在 2e-2 的容差内.
+    qk_scale = sm_scale * 1.4426950408889634  # log2(e)
+
+    offset_q_h = tl.arange(0, group_size)
+    offset_q_s = q_id * BLOCK_Q_S + tl.arange(0, BLOCK_Q_S)
+    offset_d = tl.arange(0, d_model)
+    q = tl.load(
+        q_ptr + offset_q_h[:, None, None] * stride_q_h\
+                + offset_q_s[None, :, None] * stride_q_s\
+                + offset_d[None, None, :] * stride_q_d, 
+        mask=offset_q_s[None, :, None] < seq_len,  # 只载入本序列的部分
+        other=0.0,
+    ) # [group_size, BLOCK_Q_S, d_model] BF16
+    q = (q * qk_scale).to(tl.bfloat16)
+
+    acc = tl.zeros((group_size, BLOCK_Q_S, d_model), dtype=tl.float32)
+    m_i = tl.zeros((group_size, BLOCK_Q_S), dtype=tl.float32) - float("inf")
+    l_i = tl.zeros((group_size, BLOCK_Q_S), dtype=tl.float32)
+
+    for s0 in tl.range(0, (q_id + 1) * BLOCK_Q_S, TILE_KV_S):
+        offset_kv_s = s0 + tl.arange(0, TILE_KV_S)
+        k = tl.load(
+            k_ptr + offset_kv_s[None, None, :] * stride_k_s\
+                    + offset_d[None, :, None] * stride_k_d,
+            mask=offset_kv_s[None, None, :] < seq_len,
+            other=0.0,
+        ) # [1, d_model, TILE_KV_S] BF16
+        v = tl.load(
+            v_ptr + offset_kv_s[None, :, None] * stride_v_s\
+                    + offset_d[None, None, :] * stride_v_d,
+            mask=offset_kv_s[None, :, None] < seq_len,
+            other=0.0,
+        ) # [1, TILE_KV_S, d_model] BF16
+
+        # scale 已经折进 q 里, 这里不用再乘
+        qk = tl.dot(q, tl.broadcast_to(k, (group_size, d_model, TILE_KV_S))) # [group_size, BLOCK_Q_S, TILE_KV_S] FP32
+        # 两个条件都要: causal(不看未来) + 不越过本序列末尾.
+        # **注意括号**: Python 里 `&` 的优先级高于 `<`, 写成
+        #   (A >= B) & B < seq_len
+        # 会被解析成 ((A >= B) & B) < seq_len -- bool 和整数按位与之后再比较,
+        # 完全不是想要的东西, 而且不报错.
+        qk = tl.where(
+            (offset_q_s[None, :, None] >= offset_kv_s[None, None, :])
+            & (offset_kv_s[None, None, :] < seq_len),
+            qk,
+            -float("inf"),
+        )
+
+        m_i_new = tl.maximum(m_i, tl.max(qk, axis=2))
+        alpha = tl.math.exp2(m_i - m_i_new)
+        p = tl.math.exp2(qk - m_i_new[:, :, None])
+
+        acc = alpha[:, :, None] * acc + \
+            tl.dot(p.to(tl.bfloat16), tl.broadcast_to(v, (group_size, TILE_KV_S, d_model)))
+
+        l_i = alpha * l_i + tl.sum(p, axis=2)
+        m_i = m_i_new
+
+    acc = acc / l_i[:, :, None]
+    tl.store(
+        o_ptr + offset_q_h[:, None, None] * stride_o_h\
+                + offset_q_s[None, :, None] * stride_o_s\
+                + offset_d[None, None, :] * stride_o_d,
+        acc.to(o_ptr.dtype.element_ty),
+        mask=offset_q_s[None, :, None] < seq_len,
+    )
+    
 
 
 @torch.library.triton_op("wy_lib::gqa_attention_varlen_causal", mutates_args=())

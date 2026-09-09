@@ -47,7 +47,18 @@ def _gqa_attention_without_kvcache_casual_triton(
     TILE_KV_S: tl.constexpr
 ):
     # 不考虑kv cache的情况下 需要对q的完整序列维度进行计算
-    q_id = tl.program_id(0)
+    #
+    # **逆序发射**: causal 让 q 块 m 的循环上界是 m+1 个 KV 块, 工作量正比于 m+1,
+    # 块号越大越重. CTA 大致按 program_id 递增顺序发射, 正序的话轻的先上、
+    # 最重的最后才开始, 尾巴很长; 反过来让重的先占住 SM, 轻的填进空出来的槽位
+    # -- 经典的 LPT(最长处理时间优先)调度. 实测(A100, B=1):
+    #
+    #     T=512    43.0 ->  41.7us   +3.1%
+    #     T=2048  275.3 -> 215.8us  +27.6%
+    #     T=8192 3148.5 -> 2038.9us +54.4%
+    #
+    # 序列越长收益越大, 因为块数越多、最重的那块相对越重. 代价是零.
+    q_id = tl.num_programs(0) - 1 - tl.program_id(0)
     # 按照kv 的 num head 起block
     head_id = tl.program_id(1)
     batch_id = tl.program_id(2)

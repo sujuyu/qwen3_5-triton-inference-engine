@@ -27,9 +27,11 @@ def _depthwise_causal_conv4_prefill_kernel(
     stride_weight_d: tl.constexpr, stride_weight_k: tl.constexpr,
     out_ptr, # [T, 6144] BF16,
     stride_out_t, stride_out_d,
+    seq_start_ptr, # [T] INT32, 每个 token 所属序列的起始下标; VARLEN=False 时不读
     T: int,
     D: int,
     T_BUCKET: tl.constexpr,
+    VARLEN: tl.constexpr,
     BLOCK_T: tl.constexpr, BLOCK_D: tl.constexpr,
 ):
     pid_t = tl.program_id(0)
@@ -40,10 +42,29 @@ def _depthwise_causal_conv4_prefill_kernel(
     offset_k = tl.arange(0, 4)
 
     input_t = offset_t[None, :, None] + offset_k[:, None, None] - 3
+
+    # 变长打包(packing)下唯一要改的地方: 回看的下界.
+    #
+    # conv 的窗口是固定的 4 个 tap, `input_t` 落在 [offset_t-3, offset_t] 里 --
+    # **只往回看, 不往前看**. 所以上界不用管(input_t <= offset_t, 而 offset_t
+    # 本来就在自己序列内), 只有下界要从「全局 0」换成「本序列的起点」,
+    # 否则一条序列开头的前 3 个位置会读到上一条序列的尾巴.
+    #
+    # 这也是它比 attention 好改的原因: kernel 需要多少「序列感知」, 取决于它
+    # 往回够多远. conv 的作用域是固定的 4, 所以一个下界钳位就够, grid 一点不用动,
+    # 也就没有空转 CTA; attention 的作用域是整条序列, 才需要 grid 加 batch 维、
+    # 早退、per-序列的循环边界那一整套.
+    if VARLEN:
+        lower = tl.load(
+            seq_start_ptr + offset_t, mask=offset_t < T, other=0
+        )[None, :, None]
+    else:
+        lower = 0
+
     x_offsets = input_t * stride_x_t + offset_d[None, None, :] * stride_x_d
     x_mask = (
         (offset_t[None, :, None] < T) &
-        (input_t >= 0) &
+        (input_t >= lower) &
         (input_t < T) &
         (offset_d[None, None, :] < D)
     )
@@ -87,7 +108,19 @@ def _token_bucket(token_num: int) -> int:
 def depthwise_causal_conv4_prefill(
     x: torch.Tensor,
     weight: torch.Tensor,
+    seq_start: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    """depthwise causal Conv4 + SiLU.
+
+    `seq_start` 传 `[T]` INT32 时进入变长打包模式: 第 t 个 token 回看时不会越过
+    `seq_start[t]`. 传 None 时是原来的单序列行为(下界为 0), 两者数值完全一致
+    -- 单序列下 seq_start 恒为 0.
+
+    host 侧构造:
+
+        seq_start = torch.repeat_interleave(cu_seqlens[:-1], lengths)
+        # lengths=[3,6,2] -> [0,0,0, 3,3,3,3,3,3, 9,9]
+    """
     assert x.ndim == 2
     assert weight.ndim in (2, 3)
     assert x.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16
@@ -103,6 +136,17 @@ def depthwise_causal_conv4_prefill(
         assert weight.shape == (hidden_dim, 1, 4)
         stride_weight_d = weight.stride(0)
         stride_weight_k = weight.stride(2)
+
+    varlen = seq_start is not None
+    if varlen:
+        assert seq_start.dtype == torch.int32 and seq_start.shape == (token_num,), (
+            f"seq_start 应为 [T]={(token_num,)} 的 INT32, 实际 "
+            f"{tuple(seq_start.shape)} {seq_start.dtype}"
+        )
+        assert seq_start.device == x.device
+    else:
+        # kernel 里 VARLEN=False 那条分支不会读它, 但 Triton 仍要一个合法指针
+        seq_start = x
 
     out = torch.empty_like(x)
 
@@ -122,9 +166,11 @@ def depthwise_causal_conv4_prefill(
         out_ptr=out,
         stride_out_t=out.stride(0),
         stride_out_d=out.stride(1),
+        seq_start_ptr=seq_start,
         T=token_num,
         D=hidden_dim,
         T_BUCKET=_token_bucket(token_num),
+        VARLEN=varlen,
     )
     return out
 
@@ -133,6 +179,7 @@ def depthwise_causal_conv4_prefill(
 def _depthwise_causal_conv4_prefill_fake(
     x: torch.Tensor,
     weight: torch.Tensor,
+    seq_start: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return torch.empty_like(x)
 
@@ -140,8 +187,23 @@ def _depthwise_causal_conv4_prefill_fake(
 def call_depthwise_causal_conv4_prefill_triton(
     x: torch.Tensor,
     weight: torch.Tensor,
+    seq_start: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    return depthwise_causal_conv4_prefill(x, weight)
+    return depthwise_causal_conv4_prefill(x, weight, seq_start)
+
+
+def build_seq_start(
+    lengths: list[int], *, device: torch.device | str = "cuda"
+) -> torch.Tensor:
+    """长度列表 -> `[total_tokens]` INT32, 每个 token 所属序列的起始下标."""
+    starts, acc = [], 0
+    for n in lengths:
+        starts.append(acc)
+        acc += n
+    return torch.repeat_interleave(
+        torch.tensor(starts, dtype=torch.int32, device=device),
+        torch.tensor(lengths, device=device),
+    )
 
 
 def _torch_reference(
@@ -192,4 +254,39 @@ if __name__ == "__main__":
             f"best_config={_depthwise_causal_conv4_prefill_kernel.best_config}"
         )
 
-    print("All depthwise causal Conv4 prefill tests passed.")
+    # ---- 变长打包 --------------------------------------------------------
+    # 判据: 打包起来跑一次, 逐条切出来必须和「逐条单独跑」逐字节相同.
+    # 这直接检验边界钳位对不对 -- 如果下界还是全局 0, 每条序列开头的前 3 个位置
+    # 会读到上一条序列的尾巴, 结果就对不上.
+    print("\n=== 变长打包 ===")
+    hidden_dim = 6144
+    for lengths in ([5], [3, 6, 2], [1, 1, 1, 1], [4, 4], [1, 17, 3, 64], [2, 1, 3]):
+        total = sum(lengths)
+        x = torch.randn((total, hidden_dim), dtype=torch.bfloat16, device="cuda")
+        weight = torch.randn((hidden_dim, 4), dtype=torch.bfloat16, device="cuda")
+
+        seq_start = build_seq_start(lengths)
+        packed = call_depthwise_causal_conv4_prefill_triton(x, weight, seq_start)
+
+        parts, offset = [], 0
+        for n in lengths:
+            parts.append(
+                call_depthwise_causal_conv4_prefill_triton(x[offset : offset + n], weight)
+            )
+            offset += n
+        one_by_one = torch.cat(parts, dim=0)
+
+        same = torch.equal(packed, one_by_one)
+        print(f"  lengths={str(lengths):<20} total={total:<5} 逐字节相同={same}")
+        assert same, "打包结果与逐条单独跑不一致, 边界钳位有问题"
+
+    # 不传 seq_start 时必须和原来完全一样
+    x = torch.randn((17, hidden_dim), dtype=torch.bfloat16, device="cuda")
+    weight = torch.randn((hidden_dim, 4), dtype=torch.bfloat16, device="cuda")
+    assert torch.equal(
+        call_depthwise_causal_conv4_prefill_triton(x, weight),
+        call_depthwise_causal_conv4_prefill_triton(x, weight, build_seq_start([17])),
+    ), "单序列下传不传 seq_start 应当完全一致"
+    print("  单序列: 传与不传 seq_start 结果相同")
+
+    print("\nAll depthwise causal Conv4 prefill tests passed.")

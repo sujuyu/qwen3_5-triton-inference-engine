@@ -304,6 +304,53 @@ def main() -> None:
             )
         print(f"  B={batch} : {len(outs)} 条全部与 B=1 逐 token 相同 ✓")
 
+    # ---- 9. 打包(varlen) prefill vs 逐条 prefill -------------------------
+    # 打包把 B 条变长 prompt 拼成一条扁平序列, 一次前向跑完. 只有三个算子有跨
+    # token 交互需要知道边界: attention(cu_seqlens)、conv4_prefill(seq_start)、
+    # GDN 递推(cu_seqlens). 其余逐 token 的算子拿 [total_tokens, ...] 一行不用改.
+    #
+    # 判据用 greedy token + 相对误差, 不用逐字节相等. 原因是 autotune 的 key 里
+    # 有 T_BUCKET/ROW_BUCKET: 打包时看到的是**总长**、逐条时看到的是各自长度,
+    # 落进不同的桶就选到不同 config, 归约顺序一变, 24 层累积下来能到 1e-2 量级.
+    # 实测把所有分桶函数钉成常数之后两边**逐位相同(0.00e+00)**, 所以这是舍入
+    # 而不是逻辑错误 -- 这个「钉住 config 再对拍」的手法值得记住.
+    print("\n=== 打包 prefill vs 逐条 prefill ===")
+    from engine.runner import build_packed_batch  # noqa: F401  (确保可导入)
+    from triton_kernels.vocab_argmax import lm_head_argmax as _argmax2
+
+    for lengths in ([prompt_len], [prompt_len] * 3, [7, 100, 1, 64]):
+        batch = len(lengths)
+        prompts = [
+            prompt.repeat((n + prompt_len - 1) // prompt_len)[:n].contiguous()
+            for n in lengths
+        ]
+        c_one = allocate_caches(runner.w, max(lengths) + 64, paged=True, batch=batch)
+        c_pack = allocate_caches(runner.w, max(lengths) + 64, paged=True, batch=batch)
+        try:
+            c_one.reset()
+            ref_h = [runner.prefill(prompts[b], c_one, seq=b) for b in range(batch)]
+            c_pack.reset()
+            got_h = runner.prefill_packed(prompts, c_pack)
+
+            assert torch.equal(c_one.pos, c_pack.pos), "两条路径的 pos 不一致"
+            worst = max(rel(g, r_)[1] for g, r_ in zip(got_h, ref_h))
+            tok_ref = [int(_argmax2(h, runner.w.embed_tokens).item()) for h in ref_h]
+            tok_got = [int(_argmax2(h, runner.w.embed_tokens).item()) for h in got_h]
+            assert tok_got == tok_ref, f"首 token 不一致: {tok_got} vs {tok_ref}"
+            # GDN 的两个 cache 也要按序列对齐
+            st_err = max(
+                rel(c_pack.recurrent_states[0][b], c_one.recurrent_states[0][b])[1]
+                for b in range(batch)
+            )
+            print(
+                f"  lengths={str(lengths):<20} hidden rel={worst:.2e} "
+                f"gdn_state rel={st_err:.2e}  首 token 相同 ✓"
+            )
+            assert worst < 0.05 and st_err < 0.05
+        finally:
+            del c_one, c_pack
+            torch.cuda.empty_cache()
+
     print("\nAll decode parity tests passed.")
 
 
